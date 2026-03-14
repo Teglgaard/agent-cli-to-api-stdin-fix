@@ -89,6 +89,7 @@ async def test_non_streaming():
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.post(
             "http://localhost:8000/v1/chat/completions",
+            headers={"Authorization": "Bearer devtoken"},  # Match .env token
             json={
                 "model": "cursor-agent",
                 "messages": [
@@ -144,6 +145,7 @@ async def test_streaming():
         async with client.stream(
             "POST",
             "http://localhost:8000/v1/chat/completions",
+            headers={"Authorization": "Bearer devtoken"},  # Match .env token
             json={
                 "model": "cursor-agent",
                 "messages": [
@@ -189,14 +191,36 @@ async def test_streaming():
             full_content = "".join(content_parts)
             print(f"\nAssembled content: {repr(full_content)}")
             
-            # Find the final chunk with usage
-            # Note: OpenAI streaming format doesn't typically include usage in chunks
-            # But we can verify the content was streamed correctly
+            # Find the final chunk with usage (should be in the chunk with finish_reason)
+            final_chunk_with_usage = None
+            for chunk in chunks:
+                if "choices" in chunk and chunk["choices"]:
+                    finish_reason = chunk["choices"][0].get("finish_reason")
+                    if finish_reason and "usage" in chunk:
+                        final_chunk_with_usage = chunk
+                        break
+            
             assert len(content_parts) > 0, "Should have received content"
             assert full_content, "Should have assembled content"
             
+            # Verify usage is in final chunk
+            if final_chunk_with_usage:
+                usage = final_chunk_with_usage["usage"]
+                print(f"\n✅ Final chunk includes usage:")
+                print(f"  prompt_tokens: {usage.get('prompt_tokens')}")
+                print(f"  completion_tokens: {usage.get('completion_tokens')}")
+                print(f"  total_tokens: {usage.get('total_tokens')}")
+                if "prompt_tokens_details" in usage:
+                    print(f"  cached_tokens: {usage['prompt_tokens_details'].get('cached_tokens')}")
+                
+                assert usage["prompt_tokens"] == 1250
+                assert usage["completion_tokens"] == 89
+                assert usage["total_tokens"] == 1339
+                assert usage["prompt_tokens_details"]["cached_tokens"] == 8500
+            else:
+                print("\n⚠️  Warning: Usage not found in final chunk (legacy behavior)")
+            
             print("\n✅ Streaming works correctly!")
-            print("Note: Token usage is tracked internally and logged by the server.")
             return True
 
 
@@ -218,10 +242,17 @@ async def main():
         env["CURSOR_AGENT_BIN"] = str(mock_cursor_agent)
         env["CURSOR_AGENT_WORKSPACE"] = str(Path.cwd())
         env["LOG_EVENTS"] = "true"
+        # Disable auth for testing
+        env["CODEX_GATEWAY_TOKEN"] = ""
         
         print("\nStarting agent-cli-to-api server...")
         server_process = subprocess.Popen(
-            [sys.executable, "-m", "uvicorn", "codex_gateway.server:app", "--host", "127.0.0.1", "--port", "8000"],
+            [
+                sys.executable, "-m", "codex_gateway.cli",
+                "cursor-agent",
+                "--host", "127.0.0.1",
+                "--port", "8000"
+            ],
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,

@@ -12,11 +12,15 @@ This repository contains a minimal fix for the ARG_MAX limitation in [agent-cli-
 
 2. **Missing token usage:** cursor-agent token usage (prompt_tokens, completion_tokens, cache tokens) was not being extracted and returned in API responses.
 
+3. **Streaming usage not reported:** Token usage was not included in the final streaming chunk, breaking OpenClaw and other OpenAI-compatible clients.
+
 ## Solution
 
 1. Pass prompts via stdin instead of argv - bypassing ARG_MAX completely.
 
 2. Add `extract_usage_from_cursor_agent_result()` to properly extract and report token usage from cursor-agent, including cache hit/miss tracking.
+
+3. Include usage in final streaming chunk for OpenClaw/OpenAI compatibility.
 
 ## Files
 
@@ -52,9 +56,14 @@ This repository contains a minimal fix for the ARG_MAX limitation in [agent-cli-
 + maybe_usage = extract_usage_from_cursor_agent_result(evt)
 + if maybe_usage:
 +     stream_usage = maybe_usage
+
+# 6. Add usage to final streaming chunk (OpenClaw compatibility)
+  end = {...}
++ if stream_usage:
++     end["usage"] = stream_usage
 ```
 
-Total: **2 import changes + 6 call site changes + 6 usage extraction lines = ~17 lines**
+Total: **2 import changes + 6 call site changes + 8 usage extraction/reporting lines = ~20 lines**
 
 ## Testing
 

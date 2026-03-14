@@ -33,8 +33,9 @@ Pass prompts via stdin instead of argv, bypassing ARG_MAX entirely.
   - Remove 6x `cmd.append(prompt)` and add 6x `stdin_data=prompt`
   - Add usage extraction in non-streaming path (3 lines)
   - Add usage extraction in streaming path (3 lines)
+  - Add usage to final streaming chunk (2 lines) - **Critical for OpenClaw compatibility**
 
-**Total:** 1 new file + ~17 line changes
+**Total:** 1 new file + ~20 line changes
 
 ## Code Changes
 
@@ -66,6 +67,42 @@ async for evt in iter_stream_json_events(
     env=None,
     # ...
 ):
+```
+
+### Usage extraction (cursor-agent non-streaming)
+```python
+async for evt in iter_stream_json_events(...):
+    extract_cursor_agent_delta(evt, assembler)
++   maybe_usage = extract_usage_from_cursor_agent_result(evt)
++   if maybe_usage:
++       usage = maybe_usage
+```
+
+### Usage extraction (cursor-agent streaming)
+```python
+delta = extract_cursor_agent_delta(evt, assembler)
++ maybe_usage = extract_usage_from_cursor_agent_result(evt)
++ if maybe_usage:
++     stream_usage = maybe_usage
+```
+
+### Usage in final streaming chunk (OpenClaw compatibility)
+```python
+end = {
+    "id": resp_id,
+    "object": "chat.completion.chunk",
+    "created": created,
+    "model": requested_model,
+    "choices": [{
+        "index": 0,
+        "delta": {},
+        "finish_reason": "stop",
+    }],
+}
++ # Include usage in final chunk for OpenClaw/OpenAI compatibility
++ if stream_usage:
++     end["usage"] = stream_usage
+yield f"data: {json.dumps(end, ensure_ascii=False)}\n\n"
 ```
 
 ## Test Results
