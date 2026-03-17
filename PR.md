@@ -19,7 +19,9 @@ This occurs because prompts are passed as command-line arguments, exceeding the 
 
 Pass prompts via stdin instead of argv, bypassing ARG_MAX entirely.
 
-**Bonus fix:** Added missing token usage extraction for cursor-agent. Previously, cursor-agent didn't report token counts (prompt_tokens, completion_tokens, cache tokens) in API responses, even though the CLI provided this data.
+**Bonus fixes:** 
+1. Added missing token usage extraction for cursor-agent. Previously, cursor-agent didn't report token counts (prompt_tokens, completion_tokens, cache tokens) in API responses, even though the CLI provided this data.
+2. Fixed rate limit failover for OpenClaw. Rate limit errors now return HTTP 429 with `rate_limit_error` type, enabling OpenClaw to recognize and trigger automatic failover to the next model.
 
 ## Changes
 
@@ -34,8 +36,9 @@ Pass prompts via stdin instead of argv, bypassing ARG_MAX entirely.
   - Add usage extraction in non-streaming path (3 lines)
   - Add usage extraction in streaming path (3 lines)
   - Add usage to final streaming chunk (2 lines) - **Critical for OpenClaw compatibility**
+  - Add rate limit detection in `_openai_error()` (8 lines) - **Enables OpenClaw failover**
 
-**Total:** 1 new file + ~20 line changes
+**Total:** 1 new file + ~28 line changes
 
 ## Code Changes
 
@@ -104,6 +107,35 @@ end = {
 +     end["usage"] = stream_usage
 yield f"data: {json.dumps(end, ensure_ascii=False)}\n\n"
 ```
+
+### Rate limit detection (OpenClaw failover)
+```python
+def _openai_error(message: str, *, status_code: int = 500):
++   # Detect rate limit errors for OpenClaw failover
++   error_type = "codex_gateway_error"
++   error_code = None
++   
++   message_lower = message.lower()
++   if any(phrase in message_lower for phrase in [
++       "hit your limit", "rate limit", "too many requests",
++       "quota exceeded", "usage limit"
++   ]):
++       error_type = "rate_limit_error"
++       error_code = "rate_limit_exceeded"
++       status_code = 429  # Override to 429 for rate limits
+    
+    payload = ErrorResponse(
+        error={
+            "message": message,
++           "type": error_type,
+            "param": None,
++           "code": error_code,
+        }
+    )
+    return JSONResponse(status_code=status_code, content=payload)
+```
+
+**Why this matters:** OpenClaw only triggers failover for HTTP 429 with `rate_limit_error` type. Without this, Claude Code rate limits show as generic 500 errors and block the workflow instead of automatically failing over to the next model.
 
 ## Test Results
 

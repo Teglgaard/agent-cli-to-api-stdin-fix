@@ -14,6 +14,8 @@ This repository contains a minimal fix for the ARG_MAX limitation in [agent-cli-
 
 3. **Streaming usage not reported:** Token usage was not included in the final streaming chunk, breaking OpenClaw and other OpenAI-compatible clients.
 
+4. **Rate limit failover broken:** Rate limit errors returned HTTP 500 with `codex_gateway_error`, preventing OpenClaw from recognizing them and triggering automatic failover to the next model.
+
 ## Solution
 
 1. Pass prompts via stdin instead of argv - bypassing ARG_MAX completely.
@@ -22,6 +24,8 @@ This repository contains a minimal fix for the ARG_MAX limitation in [agent-cli-
 
 3. Include usage in final streaming chunk for OpenClaw/OpenAI compatibility.
 
+4. Automatically detect rate limit errors and return HTTP 429 with `rate_limit_error` type, enabling OpenClaw to recognize and trigger automatic failover.
+
 ## Files
 
 **For PR to upstream:**
@@ -29,6 +33,7 @@ This repository contains a minimal fix for the ARG_MAX limitation in [agent-cli-
 - `test_integration_stdin.py` - Integration tests for stdin fix
 - `test_cursor_agent_usage.py` - Unit tests for token usage (optional)
 - `test_cursor_agent_api_integration.py` - API integration tests for token usage (optional)
+- `test_rate_limit_failover.py` - Tests for rate limit detection (optional)
 - `PR.md` - Pull request description
 
 **Changes needed in upstream server.py:**
@@ -61,9 +66,20 @@ This repository contains a minimal fix for the ARG_MAX limitation in [agent-cli-
   end = {...}
 + if stream_usage:
 +     end["usage"] = stream_usage
+
+# 7. Add rate limit detection in _openai_error() for failover
+  def _openai_error(message: str, *, status_code: int = 500):
++     # Detect rate limit errors for OpenClaw failover
++     if any(phrase in message.lower() for phrase in [
++         "hit your limit", "rate limit", "too many requests",
++         "quota exceeded", "usage limit"
++     ]):
++         error_type = "rate_limit_error"
++         error_code = "rate_limit_exceeded"
++         status_code = 429
 ```
 
-Total: **2 import changes + 6 call site changes + 8 usage extraction/reporting lines = ~20 lines**
+Total: **2 import changes + 6 call site changes + 8 usage extraction/reporting + 8 rate limit detection = ~28 lines**
 
 ## Testing
 
