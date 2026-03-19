@@ -32,19 +32,15 @@ git push -u origin master
    git checkout -b fix/stdin-argmax
    ```
 
-5. Copy files from this repo:
+5. Copy files from this repo into your fork (full sync):
    ```bash
-   # Copy the core fix
    cp codex_gateway/stream_json_cli_stdin.py <path-to-fork>/codex_gateway/
-   
-   # Copy the test
+   cp codex_gateway/server.py <path-to-fork>/codex_gateway/   # or merge manually; see PR.md
    cp test_integration_stdin.py <path-to-fork>/
+   cp test_cursor_agent_usage.py test_rate_limit_failover.py <path-to-fork>/  # optional
    ```
 
-6. Edit `server.py` in the fork (13 line changes):
-   - Change import: `from .stream_json_cli_stdin import`
-   - Remove 6× `cmd.append(prompt)`
-   - Add 6× `stdin_data=prompt` parameter
+6. If you prefer a minimal upstream PR instead of replacing `server.py`, apply the edits listed in `PR.md` / `README.md` (stdin, cursor usage, streaming `usage`, `_openai_error` 429 mapping, Claude `--dangerously-skip-permissions`).
 
 7. Commit changes:
    ```bash

@@ -224,6 +224,40 @@ User → Continues working seamlessly 🎉
 
 Ready for production use with OpenClaw!
 
+## OpenClaw configuration (required for fallback on 429)
+
+Per [OpenClaw model failover](https://docs.openclaw.ai/concepts/model-failover), OpenClaw exhausts **auth profiles for the current provider** before advancing `agents.defaults.model.fallbacks`. If your primary and fallback models are registered under the **same** custom provider id (e.g. both under `custom-127-0-0-1-11434`), failover to the “next model” may not run as you expect—the gateway can return HTTP 429 correctly while OpenClaw still surfaces the error.
+
+**Working pattern:** define **two provider entries** that share the same `baseUrl` (same agent-cli-to-api instance), each listing one model:
+
+```json
+"providers": {
+  "custom-claude-11434": {
+    "baseUrl": "http://127.0.0.1:11434/v1",
+    "api": "openai-completions",
+    "models": [{ "id": "claude:claude-sonnet-4-6" }]
+  },
+  "custom-cursor-11434": {
+    "baseUrl": "http://127.0.0.1:11434/v1",
+    "api": "openai-completions",
+    "models": [{ "id": "cursor:sonnet-4.5-thinking" }]
+  }
+}
+```
+
+```json
+"agents": {
+  "defaults": {
+    "model": {
+      "primary": "custom-claude-11434/claude:claude-sonnet-4-6",
+      "fallbacks": ["custom-cursor-11434/cursor:sonnet-4.5-thinking"]
+    }
+  }
+}
+```
+
+This aligns with OpenClaw’s provider-first failover semantics and allows 429 from the Claude provider to advance to the Cursor provider.
+
 ## Related Documentation
 
 - [OpenClaw Model Failover](https://docs.openclaw.ai/concepts/model-failover)

@@ -21,7 +21,9 @@ Pass prompts via stdin instead of argv, bypassing ARG_MAX entirely.
 
 **Bonus fixes:** 
 1. Added missing token usage extraction for cursor-agent. Previously, cursor-agent didn't report token counts (prompt_tokens, completion_tokens, cache tokens) in API responses, even though the CLI provided this data.
-2. Fixed rate limit failover for OpenClaw. Rate limit errors now return HTTP 429 with `rate_limit_error` type, enabling OpenClaw to recognize and trigger automatic failover to the next model.
+2. Fixed rate limit failover for OpenClaw. Rate limit errors now return HTTP 429 with `rate_limit_error` type, matching OpenAI-compatible clients’ expectations.
+3. Claude Code: pass `--dangerously-skip-permissions` when invoking the CLI so shell/tool use does not block on interactive approval in headless/OpenClaw setups.
+4. **OpenClaw:** failover to the next model in `agents.defaults.model.fallbacks` is **provider-scoped** per [OpenClaw model failover](https://docs.openclaw.ai/concepts/model-failover). If Claude and Cursor both use the same custom provider id, OpenClaw may not advance the fallback chain on 429. Use **separate provider entries** (same `baseUrl` is fine), e.g. `custom-claude-11434/...` → fallback `custom-cursor-11434/...`. See `RATE_LIMIT_FAILOVER_FIX.md` § OpenClaw configuration.
 
 ## Changes
 
@@ -36,9 +38,12 @@ Pass prompts via stdin instead of argv, bypassing ARG_MAX entirely.
   - Add usage extraction in non-streaming path (3 lines)
   - Add usage extraction in streaming path (3 lines)
   - Add usage to final streaming chunk (2 lines) - **Critical for OpenClaw compatibility**
-  - Add rate limit detection in `_openai_error()` (8 lines) - **Enables OpenClaw failover**
+  - Add rate limit detection in `_openai_error()` (8 lines) - **HTTP 429 + `rate_limit_error`**
+  - Add `--dangerously-skip-permissions` to Claude CLI `cmd` (2 call sites) - **headless shell approval**
 
-**Total:** 1 new file + ~28 line changes
+**Total:** 1 new file + `server.py` changes (this repo includes a full patched `server.py` for drop-in review; upstream reviewers can apply the same edits to their tree).
+
+**Repository layout:** `codex_gateway/server.py` is included so the fork matches production; upstream PR can still be reviewed as a diff against `main`.
 
 ## Code Changes
 
@@ -135,7 +140,22 @@ def _openai_error(message: str, *, status_code: int = 500):
     return JSONResponse(status_code=status_code, content=payload)
 ```
 
-**Why this matters:** OpenClaw only triggers failover for HTTP 429 with `rate_limit_error` type. Without this, Claude Code rate limits show as generic 500 errors and block the workflow instead of automatically failing over to the next model.
+### Claude Code non-interactive shell (headless / OpenClaw)
+
+```python
+cmd = [
+    settings.claude_bin,
+    "--verbose",
+    "-p",
+    "--output-format",
+    "stream-json",
+    "--add-dir",
+    settings.workspace,
+    "--dangerously-skip-permissions",  # avoid blocking on shell approval
+]
+```
+
+**Why this matters:** Clients that follow OpenAI-style errors expect HTTP **429** and `type: rate_limit_error` for quota/rate-limit cases. Without this, Claude Code limits surfaced as generic **500** errors. **Additionally**, OpenClaw advances `model.fallbacks` only after provider/profile rules in its docs—configure **distinct provider ids** for primary vs fallback when both hit the same gateway (see `RATE_LIMIT_FAILOVER_FIX.md`).
 
 ## Test Results
 
@@ -192,7 +212,7 @@ Token usage now correctly reports:
 - [x] Performance verified (<1ms overhead)
 - [x] Backward compatible
 - [x] No breaking changes
-- [x] Minimal changes (1 new file + 13 lines)
+- [x] Focused changes (stdin + usage + streaming usage + 429 mapping + Claude non-interactive flags)
 
 ---
 

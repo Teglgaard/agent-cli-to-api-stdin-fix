@@ -14,7 +14,9 @@ This repository contains a minimal fix for the ARG_MAX limitation in [agent-cli-
 
 3. **Streaming usage not reported:** Token usage was not included in the final streaming chunk, breaking OpenClaw and other OpenAI-compatible clients.
 
-4. **Rate limit failover broken:** Rate limit errors returned HTTP 500 with `codex_gateway_error`, preventing OpenClaw from recognizing them and triggering automatic failover to the next model.
+4. **Rate limit failover broken:** Rate limit errors returned HTTP 500 with `codex_gateway_error`, preventing clients from treating limits as HTTP 429 / `rate_limit_error`.
+
+5. **Claude Code interactive approvals:** Headless runs could stall on shell permission prompts; the gateway now passes `--dangerously-skip-permissions` for Claude CLI invocations.
 
 ## Solution
 
@@ -24,12 +26,21 @@ This repository contains a minimal fix for the ARG_MAX limitation in [agent-cli-
 
 3. Include usage in final streaming chunk for OpenClaw/OpenAI compatibility.
 
-4. Automatically detect rate limit errors and return HTTP 429 with `rate_limit_error` type, enabling OpenClaw to recognize and trigger automatic failover.
+4. Automatically detect rate limit errors and return HTTP 429 with `rate_limit_error` type.
+
+5. Claude Code: add `--dangerously-skip-permissions` on the CLI command line (non-streaming + streaming paths).
+
+**OpenClaw:** To actually move to the next entry in `model.fallbacks` on 429, use **separate `models.providers` entries** for primary vs fallback (same `baseUrl` is OK). See [Model failover](https://docs.openclaw.ai/concepts/model-failover) and `RATE_LIMIT_FAILOVER_FIX.md`.
 
 ## Files
 
-**For PR to upstream:**
-- `codex_gateway/stream_json_cli_stdin.py` - Core fix (replaces stream_json_cli.py) + token usage extraction
+**This repository (fully up to date with our fork):**
+- `codex_gateway/stream_json_cli_stdin.py` - stdin streaming + cursor-agent usage extraction
+- `codex_gateway/server.py` - **full patched file** (stdin, usage, streaming usage, 429 mapping, Claude flags)
+- `codex_gateway/openai_compat.py` - dependency for the stdin module tests
+- `codex_gateway/__init__.py` - package marker
+
+**Tests:**
 - `test_integration_stdin.py` - Integration tests for stdin fix
 - `test_cursor_agent_usage.py` - Unit tests for token usage (optional)
 - `test_cursor_agent_api_integration.py` - API integration tests for token usage (optional)
@@ -77,9 +88,11 @@ This repository contains a minimal fix for the ARG_MAX limitation in [agent-cli-
 +         error_type = "rate_limit_error"
 +         error_code = "rate_limit_exceeded"
 +         status_code = 429
+
+# 8. Claude CLI cmd: add "--dangerously-skip-permissions" (both Claude call sites)
 ```
 
-Total: **2 import changes + 6 call site changes + 8 usage extraction/reporting + 8 rate limit detection = ~28 lines**
+See `codex_gateway/server.py` in this repo for the complete, tested patch. Summary: **stdin + cursor usage + final-chunk usage + 429 errors + Claude non-interactive CLI flags**.
 
 ## Testing
 

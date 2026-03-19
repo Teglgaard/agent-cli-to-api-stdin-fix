@@ -1,0 +1,2367 @@
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import logging
+import os
+import re
+import sys
+import tempfile
+import threading
+import time
+import uuid
+from contextlib import aclosing, suppress
+from dataclasses import dataclass, field
+
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+
+from .codex_cli import collect_codex_text_and_usage_from_events, iter_codex_events
+from .codex_responses import (
+    build_codex_headers,
+    collect_codex_responses_text_and_usage,
+    convert_chat_completions_to_codex_responses,
+    extract_codex_usage_headers,
+    extract_codex_tool_calls,
+    iter_codex_responses_events,
+    load_codex_auth,
+    maybe_refresh_codex_auth,
+    warmup_codex_auth,
+)
+from .config import settings
+from .claude_oauth import generate_oauth as claude_oauth_generate
+from .claude_oauth import iter_oauth_stream_events as iter_claude_oauth_events
+from .gemini_cloudcode import generate_cloudcode as gemini_cloudcode_generate
+from .gemini_cloudcode import iter_cloudcode_stream_events as iter_gemini_cloudcode_events
+from .gemini_cloudcode import warmup_gemini_caches
+from .http_client import aclose_all as _aclose_http_clients
+from .openai_compat import (
+    ChatCompletionRequest,
+    ChatMessage,
+    ChatCompletionRequestCompat,
+    ErrorResponse,
+    ResponsesRequest,
+    compat_chat_request_to_chat_request,
+    extract_image_urls,
+    messages_to_prompt,
+    normalize_message_content,
+    responses_request_to_chat_request,
+)
+from .stream_json_cli_stdin import (TextAssembler,
+    extract_claude_delta,
+    extract_cursor_agent_delta,
+    extract_gemini_delta,
+    extract_usage_from_claude_result,
+    extract_usage_from_cursor_agent_result,
+    extract_usage_from_gemini_result,
+    iter_stream_json_events,)
+
+app = FastAPI(title="agent-cli-to-api", version="0.1.0")
+logger = logging.getLogger("uvicorn.error")
+
+if settings.cors_origins.strip():
+    origins = [o.strip() for o in settings.cors_origins.split(",") if o.strip()]
+    if origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=origins,
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+
+
+_semaphore = None
+_active_requests = 0  # Track current concurrent requests
+
+
+def _get_semaphore():
+    global _semaphore
+    if _semaphore is None:
+        import asyncio
+
+        _semaphore = asyncio.Semaphore(settings.max_concurrency)
+    return _semaphore
+
+
+def _get_active_requests() -> int:
+    """Get current number of active requests."""
+    return _active_requests
+
+
+@app.exception_handler(RequestValidationError)
+async def _handle_request_validation_error(request: Request, exc: RequestValidationError):
+    detail = ""
+    try:
+        detail = json.dumps(exc.errors(), ensure_ascii=False)
+    except Exception:
+        detail = str(exc)
+
+    body = getattr(exc, "body", None)
+    if body is None:
+        body_text = ""
+    else:
+        try:
+            if isinstance(body, (bytes, bytearray)):
+                body_text = body.decode(errors="ignore")
+            else:
+                body_text = json.dumps(body, ensure_ascii=False)
+        except Exception:
+            body_text = str(body)
+
+    logger.error(
+        "[validation] status=422 method=%s path=%s detail=%s body=%s",
+        request.method,
+        request.url.path,
+        _truncate_for_log(detail),
+        _truncate_for_log(body_text),
+    )
+    return await request_validation_exception_handler(request, exc)
+
+
+def _extract_reasoning_effort(req: ChatCompletionRequest) -> str | None:
+    extra = getattr(req, "model_extra", None) or {}
+    if isinstance(extra, dict):
+        direct = extra.get("reasoning_effort")
+        if isinstance(direct, str) and direct.strip():
+            return direct.strip()
+        reasoning = extra.get("reasoning")
+        if isinstance(reasoning, dict):
+            effort = reasoning.get("effort")
+            if isinstance(effort, str) and effort.strip():
+                return effort.strip()
+    return None
+
+
+def _extract_codex_session_id(req: ChatCompletionRequest, request: Request) -> str | None:
+    header_names = (
+        "x-codex-session-id",
+        "x-session-id",
+        "session-id",
+        "session_id",
+    )
+    for name in header_names:
+        value = request.headers.get(name)
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:128]
+
+    extra = getattr(req, "model_extra", None) or {}
+    if isinstance(extra, dict):
+        for key in ("session_id", "sessionId", "codex_session_id", "codexSessionId"):
+            value = extra.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()[:128]
+    return None
+
+
+def _parse_provider_model(model: str) -> tuple[str, str | None]:
+    raw = (model or "").strip()
+    if not raw:
+        return "codex", None
+
+    for prefix in ("cursor-agent:", "cursor:"):
+        if raw.startswith(prefix):
+            inner = raw.split(":", 1)[1].strip()
+            return "cursor-agent", (inner or None)
+    if raw in {"cursor-agent", "cursor"}:
+        return "cursor-agent", None
+
+    for prefix in ("claude-code:", "claude:"):
+        if raw.startswith(prefix):
+            inner = raw.split(":", 1)[1].strip()
+            return "claude", (inner or None)
+    if raw in {"claude-code", "claude"}:
+        return "claude", None
+
+    if raw.startswith("gemini:"):
+        inner = raw.split(":", 1)[1].strip()
+        return "gemini", (inner or None)
+    if raw == "gemini":
+        return "gemini", None
+
+    return "codex", raw
+
+
+def _normalize_provider(raw: str | None) -> str:
+    p = (raw or "").strip().lower()
+    if not p:
+        return "auto"
+    if p in {"auto", "codex", "cursor-agent", "claude", "gemini"}:
+        return p
+    if p in {"cursor", "cursor_agent", "cursoragent"}:
+        return "cursor-agent"
+    if p in {"claude-code", "claude_code", "claudecode"}:
+        return "claude"
+    return "auto"
+
+
+def _provider_default_model(provider: str) -> str | None:
+    if provider == "codex":
+        return settings.default_model
+    if provider == "cursor-agent":
+        return settings.cursor_agent_model or "auto"
+    if provider == "claude":
+        return settings.claude_model or "sonnet"
+    if provider == "gemini":
+        return settings.gemini_model or "gemini-3-flash-preview"
+    return None
+
+
+def _looks_like_unsupported_model_error(message: str) -> bool:
+    msg = (message or "").strip()
+    if not msg:
+        return False
+
+    detail = msg
+    try:
+        obj = json.loads(msg)
+        if isinstance(obj, dict) and isinstance(obj.get("detail"), str):
+            detail = obj["detail"]
+    except Exception:
+        pass
+
+    lowered = detail.lower()
+    return ("model is not supported" in lowered) or ("not supported when using codex" in lowered)
+
+
+def _check_auth(authorization: str | None) -> None:
+    token = settings.bearer_token
+    if not token:
+        return
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing Authorization: Bearer <token>")
+    if authorization.removeprefix("Bearer ").strip() != token:
+        raise HTTPException(status_code=403, detail="Invalid token")
+
+
+def _openai_error(message: str, *, status_code: int = 500) -> JSONResponse:
+    """
+    Return an OpenAI-compatible error response.
+    
+    Automatically detects rate limit errors and returns HTTP 429 with
+    rate_limit_error type for OpenClaw failover compatibility.
+    """
+    # Detect rate limit errors for OpenClaw failover
+    error_type = "codex_gateway_error"
+    error_code = None
+    
+    message_lower = message.lower()
+    if any(phrase in message_lower for phrase in [
+        "hit your limit",
+        "rate limit",
+        "too many requests",
+        "quota exceeded",
+        "usage limit"
+    ]):
+        error_type = "rate_limit_error"
+        error_code = "rate_limit_exceeded"
+        status_code = 429  # Override to 429 for rate limits
+    
+    payload = ErrorResponse(
+        error={
+            "message": message,
+            "type": error_type,
+            "param": None,
+            "code": error_code,
+        }
+    ).model_dump()
+    return JSONResponse(status_code=status_code, content=payload)
+
+
+def _chat_completion_to_responses(chat: dict) -> dict:
+    created = int(chat.get("created") or time.time())
+    model = chat.get("model")
+    text = ""
+    choices = chat.get("choices") or []
+    if isinstance(choices, list) and choices:
+        first = choices[0]
+        if isinstance(first, dict):
+            message = first.get("message") or {}
+            if isinstance(message, dict):
+                text = normalize_message_content(message.get("content"))
+
+    usage_out = None
+    usage = chat.get("usage")
+    if isinstance(usage, dict):
+        prompt_tokens = int(usage.get("prompt_tokens") or 0)
+        completion_tokens = int(usage.get("completion_tokens") or 0)
+        usage_out = {
+            "input_tokens": prompt_tokens,
+            "output_tokens": completion_tokens,
+            "total_tokens": int(usage.get("total_tokens") or (prompt_tokens + completion_tokens)),
+        }
+
+    output_msg = {
+        "id": f"msg_{uuid.uuid4().hex}",
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": text}],
+    }
+    resp = {
+        "id": f"resp_{uuid.uuid4().hex}",
+        "object": "response",
+        "created": created,
+        "model": model,
+        "output": [output_msg],
+    }
+    if usage_out is not None:
+        resp["usage"] = usage_out
+    return resp
+
+
+_UPSTREAM_STATUS_RE = re.compile(r"(?:\bAPI Error:\s*|\bfailed:\s*)(\d{3})\b")
+_HTTPX_STATUS_RE = re.compile(r"\b(?:Client|Server) error '(\d{3})\b")
+_GENERIC_STATUS_RE = re.compile(r"\bstatus\s*[=:]\s*(\d{3})\b")
+
+
+def _extract_upstream_status_code(err: BaseException) -> int | None:
+    msg = str(err or "").strip()
+    if not msg:
+        return None
+    for rx in (_UPSTREAM_STATUS_RE, _HTTPX_STATUS_RE, _GENERIC_STATUS_RE):
+        m = rx.search(msg)
+        if m:
+            try:
+                code = int(m.group(1))
+            except Exception:
+                continue
+            if 400 <= code <= 599:
+                return code
+    return None
+
+
+def _maybe_strip_answer_tags(text: str) -> str:
+    """
+    Optional compatibility shim for clients that parse a single do(...)/finish(...)
+    expression and/or wrap messages with <think>/<answer> tags (e.g. Open-AutoGLM).
+    """
+    if not settings.strip_answer_tags:
+        return text
+    if not text:
+        return text
+    for tag in ("<think>", "</think>", "<answer>", "</answer>"):
+        text = text.replace(tag, "")
+    return text
+
+
+def _truncate_for_log(text: str) -> str:
+    limit = settings.log_max_chars
+    if limit <= 0:
+        return ""
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}\n... (truncated, {len(text)} chars total)"
+
+
+def _inline_log_text(text: str) -> str:
+    return _truncate_for_log(text).replace("\r", "").replace("\n", "\\n")
+
+
+def _stream_inline_append(resp_id: str, text: str) -> None:
+    if not text:
+        return
+    payload = _inline_log_text(text)
+    if not payload:
+        return
+    short = _short_id(resp_id)
+    with _STREAM_INLINE_LOCK:
+        global _STREAM_INLINE_CURRENT
+        if _STREAM_INLINE_CURRENT != resp_id:
+            if _STREAM_INLINE_CURRENT is not None:
+                sys.stderr.write("\n")
+            sys.stderr.write(f"[{short}] stream: ")
+            _STREAM_INLINE_CURRENT = resp_id
+        elif resp_id not in _STREAM_INLINE_ACTIVE:
+            sys.stderr.write(f"[{short}] stream: ")
+        _STREAM_INLINE_ACTIVE.add(resp_id)
+        sys.stderr.write(payload)
+        sys.stderr.flush()
+
+
+def _stream_inline_close(resp_id: str) -> None:
+    with _STREAM_INLINE_LOCK:
+        if resp_id in _STREAM_INLINE_ACTIVE:
+            global _STREAM_INLINE_CURRENT
+            if _STREAM_INLINE_CURRENT == resp_id:
+                sys.stderr.write("\n")
+                _STREAM_INLINE_CURRENT = None
+            sys.stderr.flush()
+            _STREAM_INLINE_ACTIVE.discard(resp_id)
+
+
+_RICH_CONSOLE = None
+_STREAM_INLINE_LOCK = threading.Lock()
+_STREAM_INLINE_ACTIVE: set[str] = set()
+_STREAM_INLINE_CURRENT: str | None = None
+
+
+def _short_id(resp_id: str) -> str:
+    """Extract short ID from chatcmpl-xxx format."""
+    if resp_id.startswith("chatcmpl-"):
+        return resp_id[9:17]  # First 8 chars after prefix
+    return resp_id[:8]
+
+
+def _is_simple_value(value: object) -> bool:
+    return isinstance(value, (str, int, float, bool)) or value is None
+
+
+def _tool_label(tool: dict[str, object]) -> str | None:
+    tool_type = tool.get("type")
+    name = None
+    if isinstance(tool.get("name"), str):
+        name = tool["name"]
+    else:
+        func = tool.get("function")
+        if isinstance(func, dict) and isinstance(func.get("name"), str):
+            name = func["name"]
+    if name is None and isinstance(tool.get("tool"), str):
+        name = tool["tool"]
+    if name is None and isinstance(tool.get("id"), str):
+        name = tool["id"]
+    if isinstance(tool_type, str) and name:
+        if tool_type == "mcp" and isinstance(tool.get("server"), str):
+            return f"{tool_type}:{tool['server']}/{name}"
+        return f"{tool_type}:{name}"
+    if isinstance(tool_type, str):
+        return tool_type
+    return name
+
+
+def _summarize_tools(value: object, *, max_items: int = 8) -> str | None:
+    if not isinstance(value, list):
+        return None
+    labels: list[str] = []
+    for tool in value:
+        if not isinstance(tool, dict):
+            continue
+        label = _tool_label(tool)
+        if label:
+            labels.append(label)
+    if not labels:
+        return None
+    if len(labels) > max_items:
+        labels = labels[:max_items] + ["..."]
+    return f"[{', '.join(labels)}]"
+
+
+def _format_request_value(key: str, value: object, *, max_len: int = 160) -> str:
+    if key in {"tools", "functions"}:
+        summary = _summarize_tools(value)
+        if summary is not None:
+            text = summary
+        else:
+            text = ""
+    else:
+        text = ""
+
+    if not text:
+        if _is_simple_value(value):
+            try:
+                text = json.dumps(value, ensure_ascii=True)
+            except Exception:
+                text = repr(value)
+        elif isinstance(value, list):
+            if len(value) <= 6 and all(_is_simple_value(v) for v in value):
+                try:
+                    text = json.dumps(value, ensure_ascii=True)
+                except Exception:
+                    text = repr(value)
+            else:
+                text = f"list(len={len(value)})"
+        elif isinstance(value, dict):
+            keys = list(value.keys())
+            if len(keys) <= 6 and all(_is_simple_value(value[k]) for k in keys):
+                try:
+                    text = json.dumps(value, ensure_ascii=True)
+                except Exception:
+                    text = repr(value)
+            else:
+                preview = ", ".join(str(k) for k in keys[:6])
+                if len(keys) > 6:
+                    preview += ", ..."
+                text = f"dict(keys={len(keys)}: {preview})"
+        else:
+            text = repr(value)
+
+    text = text.replace("\r", "").replace("\n", "\\n").replace("`", "'")
+    if len(text) > max_len:
+        text = f"{text[:max_len]}... (len={len(text)})"
+    return text
+
+
+def _message_role_counts(messages: list[ChatMessage]) -> dict[str, int]:
+    counts: dict[str, int] = {"system": 0, "user": 0, "assistant": 0, "tool": 0, "developer": 0, "other": 0}
+    for msg in messages:
+        role = getattr(msg, "role", None)
+        if role in counts:
+            counts[role] += 1
+        else:
+            counts["other"] += 1
+    return counts
+
+
+def _format_request_metadata(
+    req: ChatCompletionRequest,
+    *,
+    resolved_model: str,
+    provider: str,
+    mode_label: str,
+    reasoning_effort: str,
+    effort_source: str,
+    request_effort_raw: str | None,
+) -> tuple[str, str]:
+    items: list[tuple[str, str]] = []
+    client_model = (req.model or "").strip() or "<default>"
+    items.append(("model", client_model))
+    if resolved_model and resolved_model != client_model:
+        items.append(("resolved_model", resolved_model))
+    items.append(("provider", f"{provider}/{mode_label}"))
+    items.append(("stream", str(bool(req.stream)).lower()))
+    if req.max_tokens is not None:
+        items.append(("max_tokens", str(req.max_tokens)))
+
+    reasoning_parts = [f"effective={reasoning_effort}", f"source={effort_source}"]
+    if request_effort_raw:
+        reasoning_parts.append(f"request={request_effort_raw}")
+    items.append(("reasoning_effort", " ".join(reasoning_parts)))
+
+    counts = _message_role_counts(req.messages)
+    msg_summary = (
+        f"total={len(req.messages)} system={counts['system']} user={counts['user']} "
+        f"assistant={counts['assistant']} tool={counts['tool']} developer={counts['developer']}"
+    )
+    if counts.get("other"):
+        msg_summary += f" other={counts['other']}"
+    items.append(("messages", msg_summary))
+
+    image_count = len(extract_image_urls(req.messages))
+    if image_count:
+        items.append(("images", str(image_count)))
+
+    extra = getattr(req, "model_extra", None) or {}
+    extra_items: list[tuple[str, str]] = []
+    if isinstance(extra, dict):
+        skip = {"messages", "model", "stream", "max_tokens", "reasoning", "reasoning_effort", "prompt", "input"}
+        preferred = [
+            "temperature",
+            "top_p",
+            "top_k",
+            "n",
+            "stop",
+            "presence_penalty",
+            "frequency_penalty",
+            "seed",
+            "user",
+            "response_format",
+            "tool_choice",
+            "tools",
+            "functions",
+            "function_call",
+            "parallel_tool_calls",
+            "logit_bias",
+        ]
+        seen = set()
+        for key in preferred:
+            if key in extra and key not in skip:
+                extra_items.append((key, _format_request_value(key, extra[key])))
+                seen.add(key)
+        for key in sorted(extra.keys()):
+            if key in skip or key in seen:
+                continue
+            extra_items.append((key, _format_request_value(key, extra[key])))
+
+    md_lines = ["### Core"]
+    for key, value in items:
+        md_lines.append(f"- **{key}**: `{value}`")
+    if extra_items:
+        md_lines.append("")
+        md_lines.append("### Extras")
+        for key, value in extra_items:
+            md_lines.append(f"- **{key}**: `{value}`")
+
+    plain_parts = [f"{key}={value}" for key, value in items]
+    plain_parts.extend(f"{key}={value}" for key, value in extra_items)
+    md_text = "\n".join(md_lines)
+    plain_text = " ".join(plain_parts)
+    return md_text, plain_text
+
+
+def _pick_curl_delimiter(payload: str, base: str = "CODEX_CURL_PAYLOAD") -> str:
+    delim = base
+    suffix = 2
+    while delim in payload:
+        delim = f"{base}_{suffix}"
+        suffix += 1
+    return delim
+
+
+def _build_curl_command(
+    *,
+    url: str,
+    authorization: str | None,
+    payload: dict[str, object],
+    stream: bool,
+) -> str:
+    payload_json = json.dumps(payload, ensure_ascii=False, indent=2)
+    delimiter = _pick_curl_delimiter(payload_json)
+    flags = "-sS"
+    if stream:
+        flags += " -N"
+    lines = [f"curl {flags} -X POST {url} \\", "  -H 'Content-Type: application/json' \\"]
+    if authorization:
+        lines.append(f"  -H 'Authorization: {authorization}' \\")
+    lines.append(f"  -d @- <<'{delimiter}'")
+    lines.append(payload_json)
+    lines.append(delimiter)
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Request Statistics Tracking
+# ─────────────────────────────────────────────────────────────────────────────
+@dataclass
+class RequestStats:
+    """Track request statistics for periodic reporting."""
+    total_requests: int = 0
+    successful_requests: int = 0
+    failed_requests: int = 0
+    total_duration_ms: int = 0
+    total_prompt_tokens: int = 0
+    total_completion_tokens: int = 0
+    last_report_time: float = field(default_factory=time.time)
+    
+    def record_success(self, duration_ms: int, usage: dict[str, int] | None) -> None:
+        self.total_requests += 1
+        self.successful_requests += 1
+        self.total_duration_ms += duration_ms
+        if usage:
+            self.total_prompt_tokens += usage.get("prompt_tokens", 0)
+            self.total_completion_tokens += usage.get("completion_tokens", 0)
+    
+    def record_failure(self) -> None:
+        self.total_requests += 1
+        self.failed_requests += 1
+    
+    def avg_duration_ms(self) -> float:
+        if self.successful_requests == 0:
+            return 0
+        return self.total_duration_ms / self.successful_requests
+    
+    def reset(self) -> "RequestStats":
+        """Return current stats and reset counters."""
+        snapshot = RequestStats(
+            total_requests=self.total_requests,
+            successful_requests=self.successful_requests,
+            failed_requests=self.failed_requests,
+            total_duration_ms=self.total_duration_ms,
+            total_prompt_tokens=self.total_prompt_tokens,
+            total_completion_tokens=self.total_completion_tokens,
+            last_report_time=self.last_report_time,
+        )
+        self.total_requests = 0
+        self.successful_requests = 0
+        self.failed_requests = 0
+        self.total_duration_ms = 0
+        self.total_prompt_tokens = 0
+        self.total_completion_tokens = 0
+        self.last_report_time = time.time()
+        return snapshot
+
+
+_request_stats = RequestStats()
+_STATS_INTERVAL_SECONDS = 60  # Report every 60 seconds
+
+# Store pending questions for Q+A pairing in high concurrency
+_pending_questions: dict[str, str] = {}
+
+
+def _maybe_print_stats() -> None:
+    """Print stats summary if interval has passed."""
+    global _request_stats
+    now = time.time()
+    elapsed = now - _request_stats.last_report_time
+    
+    if elapsed < _STATS_INTERVAL_SECONDS or _request_stats.total_requests == 0:
+        return
+    
+    stats = _request_stats.reset()
+    
+    try:
+        from rich.console import Console
+        from rich.table import Table
+    except Exception:
+        # Fallback to plain logging
+        logger.info(
+            "📊 Stats (last %ds): requests=%d success=%d failed=%d avg_ms=%.0f tokens=%d",
+            int(elapsed), stats.total_requests, stats.successful_requests,
+            stats.failed_requests, stats.avg_duration_ms(),
+            stats.total_prompt_tokens + stats.total_completion_tokens
+        )
+        return
+    
+    global _RICH_CONSOLE
+    if _RICH_CONSOLE is None:
+        _RICH_CONSOLE = Console(stderr=True)
+    
+    console: Console = _RICH_CONSOLE  # type: ignore[assignment]
+    
+    table = Table(title=f"📊 Stats Summary (last {int(elapsed)}s)", border_style="dim")
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", style="green", justify="right")
+    
+    table.add_row("Total Requests", str(stats.total_requests))
+    table.add_row("✅ Successful", str(stats.successful_requests))
+    table.add_row("❌ Failed", str(stats.failed_requests))
+    table.add_row("⏱️ Avg Duration", f"{stats.avg_duration_ms():.0f}ms")
+    table.add_row("📥 Prompt Tokens", f"{stats.total_prompt_tokens:,}")
+    table.add_row("📤 Completion Tokens", f"{stats.total_completion_tokens:,}")
+    table.add_row("📊 Total Tokens", f"{stats.total_prompt_tokens + stats.total_completion_tokens:,}")
+    
+    console.print(table)
+
+
+def _maybe_print_markdown(
+    resp_id: str,
+    label: str,
+    text: str,
+    *,
+    duration_ms: int | None = None,
+    usage: dict[str, int] | None = None,
+) -> bool:
+    """
+    Best-effort: render markdown to the terminal for easier reading.
+    Returns True if rendered (so callers can skip duplicate plain logging).
+    """
+    if not settings.log_render_markdown:
+        return False
+    if not text:
+        return False
+    try:
+        from rich.console import Console
+        from rich.markdown import Markdown
+        from rich.panel import Panel
+        from rich.text import Text
+    except Exception:
+        return False
+
+    global _RICH_CONSOLE
+    if _RICH_CONSOLE is None:
+        # stderr matches uvicorn's default logging stream.
+        _RICH_CONSOLE = Console(stderr=True)
+
+    console: Console = _RICH_CONSOLE  # type: ignore[assignment]
+    # For Panel display, use a much larger limit or no limit
+    # Rich Panel can handle long text gracefully
+    panel_limit = max(settings.log_max_chars * 10, 50000)  # 10x default or 50k
+    if len(text) > panel_limit:
+        payload = f"{text[:panel_limit]}\n\n... (truncated, {len(text):,} chars total)"
+    else:
+        payload = text
+    payload = payload.rstrip("\n")
+    short = _short_id(resp_id)
+    
+    # Use different styles for Q vs A
+    if label == "Q":
+        style = "cyan"
+        char_count = len(text)
+        title = f"📝 Question [{short}] 📏 {char_count:,} chars"
+    elif label == "A":
+        style = "green"
+        parts = [f"✅ Answer [{short}]"]
+        if duration_ms:
+            parts.append(f"⏱️ {duration_ms/1000:.1f}s")
+        if usage:
+            total = usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
+            if total > 0:
+                parts.append(f"🔢 {total:,} tokens")
+        title = " ".join(parts)
+    else:
+        style = "blue"
+        title = f"[{short}] {label}"
+    
+    console.print(Panel(Markdown(payload), title=title, border_style=style, expand=False))
+    return True
+
+
+def _print_qa_together(
+    resp_id: str,
+    question: str,
+    answer: str,
+    *,
+    duration_ms: int | None = None,
+    usage: dict[str, int] | None = None,
+) -> bool:
+    """
+    Print Question and Answer together in a single unified panel.
+    This ensures Q and A stay together even under high concurrency.
+    """
+    if not settings.log_render_markdown:
+        return False
+    if not question and not answer:
+        return False
+    try:
+        from rich.console import Console
+        from rich.markdown import Markdown
+        from rich.panel import Panel
+    except Exception:
+        return False
+
+    global _RICH_CONSOLE
+    if _RICH_CONSOLE is None:
+        _RICH_CONSOLE = Console(stderr=True)
+
+    console: Console = _RICH_CONSOLE  # type: ignore[assignment]
+    short = _short_id(resp_id)
+    panel_limit = max(settings.log_max_chars * 10, 50000)
+    
+    # Build combined content with Q and A sections
+    combined_parts = []
+    
+    if question:
+        q_payload = question[:panel_limit] if len(question) > panel_limit else question
+        combined_parts.append(f"## 📝 Question ({len(question):,} chars)\n\n{q_payload.rstrip()}")
+    
+    if answer:
+        a_payload = answer[:panel_limit] if len(answer) > panel_limit else answer
+        combined_parts.append(f"## ✅ Answer\n\n{a_payload.rstrip()}")
+    
+    combined = "\n\n---\n\n".join(combined_parts)
+    
+    # Build title with stats
+    title_parts = [f"[{short}]"]
+    if duration_ms:
+        title_parts.append(f"⏱️ {duration_ms/1000:.1f}s")
+    if usage:
+        total = usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
+        if total > 0:
+            title_parts.append(f"🔢 {total:,} tokens")
+    title = " ".join(title_parts)
+    
+    console.print(Panel(Markdown(combined), title=title, border_style="blue", expand=False))
+    return True
+
+
+def _print_error_panel(resp_id: str, error_msg: str, status_code: int = 500) -> None:
+    """Print error in a red panel for visibility."""
+    try:
+        from rich.console import Console
+        from rich.panel import Panel
+        from rich.text import Text
+    except Exception:
+        return
+    
+    global _RICH_CONSOLE
+    if _RICH_CONSOLE is None:
+        _RICH_CONSOLE = Console(stderr=True)
+    
+    console: Console = _RICH_CONSOLE  # type: ignore[assignment]
+    short = _short_id(resp_id)
+    
+    console.print(Panel(
+        Text(error_msg, style="bold white"),
+        title=f"❌ Error [{short}] HTTP {status_code}",
+        border_style="red",
+        expand=False
+    ))
+
+
+def _print_separator(resp_id: str, label: str = "REQUEST", *, model: str | None = None) -> None:
+    """Print a visual separator for new requests."""
+    try:
+        from rich.console import Console
+        from rich.rule import Rule
+    except Exception:
+        return
+    
+    global _RICH_CONSOLE
+    if _RICH_CONSOLE is None:
+        _RICH_CONSOLE = Console(stderr=True)
+    
+    console: Console = _RICH_CONSOLE  # type: ignore[assignment]
+    short = _short_id(resp_id)
+    active = _get_active_requests()
+    
+    # Build label with context
+    parts = [f"🔷 {label}"]
+    if model:
+        parts.append(f"model={model}")
+    parts.append(f"[{short}]")
+    if active > 1:
+        parts.append(f"📥 {active} concurrent")
+    
+    console.print(Rule(" ".join(parts), style="bold blue"))
+
+
+_AUTOMATION_GUARD = """SYSTEM: IMPORTANT (Open-AutoGLM action mode)
+- This is an Android UI automation loop. You will be given a screenshot each turn.
+- The screenshot is already attached as an image in the user's message; use it directly (native vision).
+- Output must be machine-parseable and contain exactly ONE action.
+- Follow the required format exactly:
+  <think>short reason</think>
+  <answer>do(...)</answer> OR <answer>finish(...)</answer>
+- The <answer> must contain ONLY the action expression (no extra text).
+- Do NOT call MCP/tools to fetch screenshots/resources (e.g., list_mcp_resources/read_mcp_resource); they are unavailable here.
+- Never refuse due to environment/sandbox/tool limitations; you are NOT executing actions yourself.
+- If you are uncertain or need confirmation, output: do(action="Wait", duration="1 seconds")
+- For WeChat message sending: only finish if the latest screenshot clearly shows the outgoing message bubble
+  with the exact text AND no failure indicator (red "!", "发送失败/未发送/重发", spinner/clock). Otherwise retry/Wait.
+"""
+
+
+def _looks_like_automation_prompt(prompt: str) -> bool:
+    p = prompt or ""
+    if not p:
+        return False
+    # Open-AutoGLM style: XML tags + do(action=...) definitions in the system prompt.
+    markers = (
+        "<think>{think}</think>",
+        "<answer>{action}</answer>",
+        "do(action=\"Tap\"",
+        "do(action=\"Launch\"",
+        "finish(message=",
+        "Tap是点击操作",
+        "finish是结束任务",
+    )
+    return any(m in p for m in markers)
+
+
+def _maybe_inject_automation_guard(prompt: str) -> str:
+    if not prompt:
+        return prompt
+    if not _looks_like_automation_prompt(prompt):
+        return prompt
+    # Avoid duplicating if already present.
+    if "IMPORTANT (Open-AutoGLM action mode)" in prompt:
+        return prompt
+    return f"{_AUTOMATION_GUARD}\n\n{prompt}"
+
+
+def _maybe_inject_automation_guard_messages(messages: list[ChatMessage]) -> list[ChatMessage]:
+    if not messages:
+        return messages
+    prompt = messages_to_prompt(messages)
+    if not _looks_like_automation_prompt(prompt):
+        return messages
+    if "IMPORTANT (Open-AutoGLM action mode)" in prompt:
+        return messages
+    return [ChatMessage(role="system", content=_AUTOMATION_GUARD), *messages]
+
+
+def _mime_to_ext(mime: str) -> str:
+    mime = (mime or "").strip().lower()
+    if mime in {"image/png", "png"}:
+        return "png"
+    if mime in {"image/jpeg", "image/jpg", "jpeg", "jpg"}:
+        return "jpg"
+    if mime in {"image/webp", "webp"}:
+        return "webp"
+    return "bin"
+
+
+def _decode_data_url(data_url: str) -> tuple[bytes, str]:
+    if not data_url.startswith("data:"):
+        raise ValueError("Unsupported image_url (expected data: URL)")
+    try:
+        header, payload = data_url.split(",", 1)
+    except ValueError as e:
+        raise ValueError("Invalid data: URL") from e
+
+    if ";base64" not in header:
+        raise ValueError("Unsupported data: URL encoding (expected base64)")
+
+    mime = header.removeprefix("data:").split(";", 1)[0].strip() or "application/octet-stream"
+    # base64 payload may contain newlines; strip whitespace.
+    payload = "".join(payload.split())
+    try:
+        data = base64.b64decode(payload, validate=False)
+    except Exception as e:
+        raise ValueError("Invalid base64 image payload") from e
+
+    return data, _mime_to_ext(mime)
+
+
+def _materialize_request_images(
+    req: ChatCompletionRequest, *, resp_id: str
+) -> tuple[tempfile.TemporaryDirectory | None, list[str]]:
+    if not settings.enable_image_input:
+        return None, []
+
+    urls = extract_image_urls(req.messages)
+    if not urls:
+        return None, []
+
+    max_count = max(settings.max_image_count, 0)
+    if max_count == 0:
+        return None, []
+
+    urls = urls[-max_count:]
+    tmpdir = tempfile.TemporaryDirectory(prefix="codex-gateway-images-")
+    paths: list[str] = []
+    for idx, url in enumerate(urls):
+        data, ext = _decode_data_url(url)
+        if settings.max_image_bytes > 0 and len(data) > settings.max_image_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Image too large ({len(data)} bytes > {settings.max_image_bytes})",
+            )
+        filename = f"{resp_id}-{idx}.{ext}"
+        path = os.path.join(tmpdir.name, filename)
+        with open(path, "wb") as f:
+            f.write(data)
+        paths.append(path)
+
+    return tmpdir, paths
+
+
+@app.on_event("startup")
+async def _log_startup_config() -> None:
+    # Intentionally omit secrets (tokens, API keys).
+    provider = _normalize_provider(settings.provider)
+    
+    # Common items for all providers
+    items: list[tuple[str, object, str]] = [
+        ("provider", settings.provider, "cyan bold"),
+        ("max_concurrency", settings.max_concurrency, "green"),
+    ]
+    
+    # Provider-specific config
+    if provider == "codex":
+        mode = "responses API" if settings.use_codex_responses_api else "CLI"
+        items.extend([
+            ("mode", mode, "yellow"),
+            ("model", settings.default_model, "blue"),
+            ("workspace", settings.workspace, "dim"),
+        ])
+    elif provider == "cursor-agent":
+        items.extend([
+            ("model", settings.cursor_agent_model or "auto", "yellow"),
+            ("workspace", settings.cursor_agent_workspace or settings.workspace, "dim"),
+            ("indexing", "disabled" if settings.cursor_agent_disable_indexing else "enabled", "blue"),
+        ])
+    elif provider == "claude":
+        from .claude_oauth import get_claude_cli_config
+        cli_config = get_claude_cli_config()
+        effective_url = cli_config.base_url or settings.claude_api_base_url
+        effective_model = cli_config.default_model or settings.claude_model or "sonnet"
+        config_source = "CLI settings.json" if cli_config.base_url else "default"
+        mode = "OAuth API" if settings.claude_use_oauth_api else "CLI"
+        items.extend([
+            ("mode", mode, "yellow"),
+            ("model", effective_model, "blue"),
+            ("endpoint", effective_url, "magenta"),
+            ("config_source", config_source, "dim"),
+        ])
+    elif provider == "gemini":
+        mode = "CloudCode API" if settings.gemini_use_cloudcode_api else "CLI"
+        items.extend([
+            ("mode", mode, "yellow"),
+            ("model", settings.gemini_model or "gemini-pro", "blue"),
+            ("endpoint", settings.gemini_cloudcode_base_url, "magenta"),
+        ])
+    else:
+        # Auto or unknown provider
+        items.extend([
+            ("model", settings.default_model, "yellow"),
+        ])
+    
+    # Try rich table first
+    try:
+        from rich.console import Console
+        from rich.table import Table
+        from rich.panel import Panel
+        
+        global _RICH_CONSOLE
+        if _RICH_CONSOLE is None:
+            _RICH_CONSOLE = Console(stderr=True)
+        
+        console: Console = _RICH_CONSOLE  # type: ignore[assignment]
+        
+        table = Table(show_header=False, box=None, padding=(0, 2))
+        table.add_column("Key", style="dim")
+        table.add_column("Value")
+        
+        for key, value, style in items:
+            table.add_row(key, f"[{style}]{value}[/{style}]")
+        
+        # Provider-specific emoji
+        emoji = {"codex": "🤖", "cursor-agent": "🖱️", "claude": "🧠", "gemini": "✨"}.get(provider, "🚀")
+        
+        console.print(Panel(
+            table,
+            title=f"{emoji} Agent CLI Gateway [{provider}]",
+            subtitle=f"📍 http://{settings.host}:{settings.port}",
+            border_style="green",
+            expand=False,
+        ))
+        return
+    except Exception:
+        pass
+    
+    # Fallback to plain logging
+    plain_items = [(k, v) for k, v, _ in items]
+    width = max(len(k) for k, _ in plain_items)
+    rendered = "Gateway config:\n" + "\n".join(f"  {k:<{width}} = {v}" for k, v in plain_items)
+    logger.info(rendered)
+
+
+@app.on_event("startup")
+async def _warmup_caches() -> None:
+    """Pre-warm OAuth/project caches at startup to reduce first-request latency."""
+    provider = _normalize_provider(settings.provider)
+    
+    # Ensure cursor-agent workspace exists
+    if provider == "cursor-agent" and settings.cursor_agent_workspace:
+        os.makedirs(settings.cursor_agent_workspace, exist_ok=True)
+    
+    # Warmup Codex auth if using codex provider
+    if provider == "codex" and settings.use_codex_responses_api:
+        await warmup_codex_auth(codex_cli_home=settings.codex_cli_home)
+    
+    # Warmup Gemini caches if using gemini provider
+    if provider == "gemini" and settings.gemini_use_cloudcode_api:
+        await warmup_gemini_caches(timeout_seconds=30)
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    await _aclose_http_clients()
+
+
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True}
+
+
+@app.get("/v1/models")
+@app.get("/models")
+async def list_models(authorization: str | None = Header(default=None)):
+    _check_auth(authorization)
+    forced_provider = _normalize_provider(settings.provider)
+    default_id = _provider_default_model(forced_provider) or settings.default_model
+    if settings.advertised_models:
+        models = settings.advertised_models[:]
+    elif forced_provider != "auto" and not settings.allow_client_model_override:
+        # When the provider is fixed (operator-controlled), the client-sent `model` string is
+        # accepted but ignored by default, so we advertise a stable placeholder plus the
+        # provider's default model name.
+        models = ["default", default_id]
+    else:
+        models = [default_id]
+    if settings.model_aliases:
+        models.extend(settings.model_aliases.keys())
+        models.extend(settings.model_aliases.values())
+    # Preserve order while deduping.
+    seen: set[str] = set()
+    unique_models: list[str] = []
+    for m in models:
+        if not m or m in seen:
+            continue
+        seen.add(m)
+        unique_models.append(m)
+    return {
+        "object": "list",
+        "data": [{"id": m, "object": "model", "created": 0, "owned_by": "local"} for m in unique_models],
+    }
+
+
+@app.get("/debug/config")
+async def debug_config(authorization: str | None = Header(default=None)):
+    """
+    Return the effective runtime configuration (secrets redacted).
+
+    If `CODEX_GATEWAY_TOKEN` is set, this endpoint requires `Authorization: Bearer <token>`.
+    """
+    _check_auth(authorization)
+    return {
+        "provider": settings.provider,
+        "allow_client_provider_override": settings.allow_client_provider_override,
+        "allow_client_model_override": settings.allow_client_model_override,
+        "default_model": settings.default_model,
+        "cursor_agent_model": settings.cursor_agent_model or "auto",
+        "cursor_agent_workspace": settings.cursor_agent_workspace,
+        "cursor_agent_disable_indexing": settings.cursor_agent_disable_indexing,
+        "cursor_agent_extra_args": settings.cursor_agent_extra_args,
+        "claude_model": settings.claude_model,
+        "claude_use_oauth_api": settings.claude_use_oauth_api,
+        "claude_api_base_url": settings.claude_api_base_url,
+        "claude_oauth_base_url": settings.claude_oauth_base_url,
+        "claude_oauth_creds_path": settings.claude_oauth_creds_path,
+        "claude_oauth_client_id": settings.claude_oauth_client_id,
+        "gemini_model": settings.gemini_model,
+        "gemini_use_cloudcode_api": settings.gemini_use_cloudcode_api,
+        "gemini_cloudcode_base_url": settings.gemini_cloudcode_base_url,
+        "gemini_project_id": settings.gemini_project_id,
+        "gemini_oauth_creds_path": settings.gemini_oauth_creds_path,
+        "gemini_oauth_client_id": settings.gemini_oauth_client_id,
+        "model_reasoning_effort": settings.model_reasoning_effort,
+        "force_reasoning_effort": settings.force_reasoning_effort,
+        "use_codex_responses_api": settings.use_codex_responses_api,
+        "codex_cli_home": settings.codex_cli_home,
+        "workspace": settings.workspace,
+        "max_concurrency": settings.max_concurrency,
+        "timeout_seconds": settings.timeout_seconds,
+        "subprocess_stream_limit": settings.subprocess_stream_limit,
+        "sse_keepalive_seconds": settings.sse_keepalive_seconds,
+        "strip_answer_tags": settings.strip_answer_tags,
+        "enable_image_input": settings.enable_image_input,
+        "max_image_count": settings.max_image_count,
+        "max_image_bytes": settings.max_image_bytes,
+        "disable_shell_tool": settings.disable_shell_tool,
+        "disable_view_image_tool": settings.disable_view_image_tool,
+        "debug_log": settings.debug_log,
+        "log_mode": settings.effective_log_mode(),
+        "log_events": settings.log_events,
+        "log_max_chars": settings.log_max_chars,
+    }
+
+
+@app.post("/v1/responses")
+@app.post("/responses")
+async def responses(
+    req: ResponsesRequest,
+    request: Request,
+    authorization: str | None = Header(default=None),
+):
+    _check_auth(authorization)
+    chat_req = responses_request_to_chat_request(req)
+    if not chat_req.messages:
+        return _openai_error("Missing input for responses request", status_code=422)
+    if chat_req.stream:
+        return _openai_error(
+            "Streaming responses are not supported; set stream=false or use /v1/chat/completions",
+            status_code=400,
+        )
+
+    result = await chat_completions(chat_req, request, authorization)
+    if isinstance(result, (JSONResponse, StreamingResponse)):
+        if isinstance(result, JSONResponse) and result.status_code < 400:
+            try:
+                body = json.loads(result.body.decode("utf-8"))
+            except Exception:
+                return result
+            if isinstance(body, dict) and body.get("object") == "chat.completion":
+                converted = _chat_completion_to_responses(body)
+                headers = extract_codex_usage_headers(result.headers)
+                return JSONResponse(content=converted, headers=headers)
+        return result
+    if isinstance(result, dict):
+        return _chat_completion_to_responses(result)
+    return result
+
+
+@app.post("/v1/chat/completions")
+@app.post("/chat/completions")
+async def chat_completions(
+    req: ChatCompletionRequestCompat,
+    request: Request,
+    authorization: str | None = Header(default=None),
+):
+    _check_auth(authorization)
+    try:
+        req = compat_chat_request_to_chat_request(req)
+    except ValueError as e:
+        return _openai_error(str(e), status_code=422)
+
+    log_mode = settings.effective_log_mode()
+
+    forced_provider = _normalize_provider(settings.provider)
+    fallback_model = (
+        _provider_default_model(forced_provider if forced_provider != "auto" else "codex") or settings.default_model
+    )
+    client_model = (req.model or "").strip()
+    # If the operator forces a provider and disallows client model override, the client-provided
+    # `model` is treated as a compatibility placeholder and ignored for backend selection.
+    client_model_ignored = bool(forced_provider != "auto" and not settings.allow_client_model_override)
+    requested_model = (fallback_model if client_model_ignored else (client_model or fallback_model)).strip()
+    resolved_model = settings.model_aliases.get(requested_model, requested_model)
+    parsed_provider, provider_model = _parse_provider_model(resolved_model)
+    if settings.allow_client_provider_override or forced_provider == "auto":
+        provider = parsed_provider
+    else:
+        # Operator forces a single provider for the whole gateway; ignore request-side provider prefixes.
+        provider = forced_provider
+        if not settings.allow_client_model_override:
+            # Operator decides the provider model; ignore client-sent model strings.
+            provider_model = None
+    allowed_efforts = {"low", "medium", "high", "xhigh"}
+
+    def _normalize_effort(raw: str | None) -> str | None:
+        if raw is None:
+            return None
+        if raw == "none":
+            # Some clients send "none" to indicate minimal reasoning.
+            return "low"
+        return raw if raw in allowed_efforts else None
+    request_effort_raw = _extract_reasoning_effort(req)
+    request_effort = _normalize_effort(request_effort_raw)
+
+    forced_effort_raw = (settings.force_reasoning_effort or "").strip() or None
+    forced_effort = _normalize_effort(forced_effort_raw)
+
+    default_effort_raw = (settings.model_reasoning_effort or "").strip() or None
+    default_effort = _normalize_effort(default_effort_raw)
+
+    # Final effort is always normalized to a supported value.
+    reasoning_effort = forced_effort or request_effort or default_effort or "high"
+    # Some providers take a single prompt string; Codex backend uses structured messages.
+    prompt = _maybe_inject_automation_guard(messages_to_prompt(req.messages))
+    if len(prompt) > settings.max_prompt_chars:
+        return _openai_error(f"Prompt too large ({len(prompt)} chars)", status_code=413)
+
+    codex_session_id = _extract_codex_session_id(req, request)
+    codex_response_headers: dict[str, str] = {}
+    tool_calls: list[dict[str, object]] | None = None
+
+    created = int(time.time())
+    resp_id = f"chatcmpl-{uuid.uuid4().hex}"
+    t0 = time.time()
+
+    image_urls = extract_image_urls(req.messages)
+    use_claude_oauth = bool(provider == "claude" and settings.claude_use_oauth_api)
+    use_gemini_cloudcode = bool(provider == "gemini" and settings.gemini_use_cloudcode_api)
+    use_codex_backend = bool(
+        provider == "codex"
+        and (
+            settings.use_codex_responses_api
+            or (settings.enable_image_input and image_urls)
+            # Prefer Codex backend `/responses` for streaming requests (true SSE deltas).
+            or req.stream
+        )
+    )
+
+    sem = _get_semaphore()
+    try:
+        mode_label = "cli"
+        if provider == "codex" and use_codex_backend:
+            mode_label = "codex-responses"
+        elif provider == "claude" and use_claude_oauth:
+            mode_label = "claude-oauth"
+        elif provider == "gemini" and use_gemini_cloudcode:
+            mode_label = "gemini-cloudcode"
+
+        effort_source = "default"
+        if forced_effort:
+            effort_source = "forced"
+        elif request_effort:
+            effort_source = "request"
+        elif not default_effort:
+            effort_source = "fallback"
+        
+        # Track concurrent requests
+        global _active_requests
+        _active_requests += 1
+        
+        # Print visual separator for easier request tracking
+        if settings.log_render_markdown:
+            _print_separator(resp_id, f"{provider}/{mode_label}", model=resolved_model)
+        else:
+            # Only show INFO log when not using rich panels
+            logger.info(
+                "[%s] ▶ model=%s provider=%s mode=%s stream=%s",
+                resp_id,
+                resolved_model,
+                provider,
+                mode_label,
+                req.stream,
+            )
+        if settings.debug_log:
+            eff = provider_model or _provider_default_model(provider) or "<default>"
+            logger.info("[%s] provider_model effective=%s (client=%s)", resp_id, eff, provider_model or "<none>")
+        req_meta_md, req_meta_plain = _format_request_metadata(
+            req,
+            resolved_model=resolved_model,
+            provider=provider,
+            mode_label=mode_label,
+            reasoning_effort=reasoning_effort,
+            effort_source=effort_source,
+            request_effort_raw=request_effort_raw,
+        )
+        if settings.log_render_markdown:
+            _maybe_print_markdown(resp_id, "REQUEST PARAMS", req_meta_md)
+        else:
+            logger.info("[%s] params %s", resp_id, _truncate_for_log(req_meta_plain))
+        if settings.log_request_curl:
+            payload = req.model_dump(exclude_none=True, mode="json")
+            curl_cmd = _build_curl_command(
+                url=str(request.url),
+                authorization=authorization,
+                payload=payload,
+                stream=bool(req.stream),
+            )
+            if settings.log_render_markdown:
+                _maybe_print_markdown(resp_id, "CURL", f"```bash\n{curl_cmd}\n```")
+            else:
+                logger.info("[%s] curl:\n%s", resp_id, curl_cmd)
+        if log_mode == "qa":
+            # Collect all user messages (not just the last one)
+            user_messages = []
+            for m in req.messages:
+                if m.role == "user":
+                    content = normalize_message_content(m.content)
+                    if content:
+                        user_messages.append(content)
+            # Also check for system message that might contain instructions
+            system_parts = []
+            for m in req.messages:
+                if m.role == "system":
+                    content = normalize_message_content(m.content)
+                    if content:
+                        system_parts.append(content)
+            
+            # Combine system + user messages with better formatting
+            q_parts = []
+            if system_parts:
+                # Use markdown header + blockquote for system message
+                sys_content = "\n".join(system_parts)
+                q_parts.append(f"**🔧 System**\n\n> {sys_content.replace(chr(10), chr(10) + '> ')}")
+            if user_messages:
+                # Use markdown header for user message
+                user_content = "\n".join(user_messages)
+                q_parts.append(f"**👤 User**\n\n{user_content}")
+            
+            q = "\n\n---\n\n".join(q_parts) if q_parts else ""
+            if q:
+                # Store question for later pairing with answer (avoids interleaving in high concurrency)
+                _pending_questions[resp_id] = q
+        elif log_mode == "full":
+            logger.info("[%s] PROMPT:\n%s", resp_id, _truncate_for_log(prompt))
+
+        tmpdir: tempfile.TemporaryDirectory | None = None
+        image_files: list[str] = []
+        if provider == "codex":
+            if use_codex_backend:
+                # No temp files needed; Codex backend accepts data: URLs directly.
+                if (log_mode == "full" and image_urls) or (settings.log_events and image_urls):
+                    for idx, url in enumerate(image_urls[-max(settings.max_image_count, 0) :]):
+                        try:
+                            data, ext = _decode_data_url(url)
+                            size = len(data)
+                        except Exception:
+                            ext, size = "bin", -1
+                        logger.info("[%s] image[%d] ext=%s bytes=%d", resp_id, idx, ext, size)
+                    logger.info("[%s] decoded_images=%d", resp_id, len(image_urls))
+            else:
+                try:
+                    tmpdir, image_files = _materialize_request_images(req, resp_id=resp_id)
+                except HTTPException:
+                    raise
+                except Exception as e:
+                    return _openai_error(f"Failed to decode image input: {e}", status_code=400)
+
+                if (log_mode == "full" and image_files) or (settings.log_events and image_files):
+                    for idx, path in enumerate(image_files):
+                        try:
+                            size = os.path.getsize(path)
+                        except OSError:
+                            size = -1
+                        ext = os.path.splitext(path)[1].lstrip(".") or "bin"
+                        logger.info("[%s] image[%d] ext=%s bytes=%d", resp_id, idx, ext, size)
+                    logger.info("[%s] decoded_images=%d", resp_id, len(image_files))
+
+        def _capture_codex_headers(headers: dict[str, str]) -> None:
+            if not headers:
+                return
+            codex_response_headers.update(extract_codex_usage_headers(headers))
+
+        def _evt_log(evt: dict) -> None:
+            if not settings.log_events:
+                return
+            t = evt.get("type")
+            if t == "response.created":
+                resp = evt.get("response") or {}
+                rid = resp.get("id") if isinstance(resp, dict) else None
+                logger.info("[%s] codex %s response_id=%s", resp_id, t, rid)
+                return
+            if t == "response.completed":
+                resp = evt.get("response") or {}
+                usage = resp.get("usage") if isinstance(resp, dict) else None
+                extra = f" usage={usage}" if isinstance(usage, dict) else ""
+                logger.info("[%s] codex %s%s", resp_id, t, extra)
+                return
+            if t == "response.output_text.done":
+                text = evt.get("text") or ""
+                logger.info("[%s] codex %s chars=%d", resp_id, t, len(str(text)))
+                return
+            if t == "thread.started":
+                logger.info("[%s] codex %s thread_id=%s", resp_id, t, evt.get("thread_id"))
+                return
+            if t in {"turn.started", "turn.completed", "turn.failed"}:
+                extra = ""
+                if t == "turn.completed" and isinstance(evt.get("usage"), dict):
+                    u = evt["usage"]
+                    extra = f" usage={u}"
+                logger.info("[%s] codex %s%s", resp_id, t, extra)
+                return
+            if t == "error":
+                logger.error("[%s] codex error: %s", resp_id, _truncate_for_log(str(evt.get("message") or "")))
+                return
+            if t in {"item.started", "item.completed"}:
+                item = evt.get("item") or {}
+                itype = item.get("type")
+                if itype == "command_execution":
+                    cmd = item.get("command") or ""
+                    status = item.get("status") or ""
+                    exit_code = item.get("exit_code")
+                    logger.info("[%s] codex %s command status=%s exit=%s cmd=%s", resp_id, t, status, exit_code, cmd)
+                    out = item.get("aggregated_output")
+                    if isinstance(out, str) and out.strip():
+                        logger.info("[%s] codex command output:\n%s", resp_id, _truncate_for_log(out))
+                    return
+                if itype == "file_change":
+                    changes = item.get("changes") or []
+                    paths: list[str] = []
+                    if isinstance(changes, list):
+                        for ch in changes:
+                            if isinstance(ch, dict) and isinstance(ch.get("path"), str):
+                                kind = ch.get("kind")
+                                if isinstance(kind, str) and kind:
+                                    paths.append(f"{kind}:{ch['path']}")
+                                else:
+                                    paths.append(ch["path"])
+                    logger.info("[%s] codex %s file_change %s", resp_id, t, ", ".join(paths)[: settings.log_max_chars])
+                    return
+                if itype == "mcp_tool_call":
+                    server = item.get("server")
+                    tool = item.get("tool")
+                    status = item.get("status")
+                    logger.info(
+                        "[%s] codex %s mcp_tool_call server=%s tool=%s status=%s",
+                        resp_id,
+                        t,
+                        server,
+                        tool,
+                        status,
+                    )
+                    args = item.get("arguments")
+                    if args:
+                        try:
+                            dumped = json.dumps(args, ensure_ascii=False, default=str)
+                        except Exception:
+                            dumped = str(args)
+                        logger.info("[%s] codex mcp_tool_call args:\n%s", resp_id, _truncate_for_log(dumped))
+                    err = item.get("error")
+                    if err:
+                        try:
+                            dumped = json.dumps(err, ensure_ascii=False, default=str)
+                        except Exception:
+                            dumped = str(err)
+                        logger.warning("[%s] codex mcp_tool_call error:\n%s", resp_id, _truncate_for_log(dumped))
+                    result = item.get("result")
+                    if result:
+                        try:
+                            dumped = json.dumps(result, ensure_ascii=False, default=str)
+                        except Exception:
+                            dumped = str(result)
+                        logger.info("[%s] codex mcp_tool_call result:\n%s", resp_id, _truncate_for_log(dumped))
+                    return
+                if itype == "agent_message":
+                    text = _maybe_strip_answer_tags(str(item.get("text") or ""))
+                    logger.info("[%s] codex %s agent_message_chars=%d", resp_id, t, len(text))
+                    logger.info("[%s] codex agent_message:\n%s", resp_id, _truncate_for_log(text))
+                    return
+                if itype == "reasoning":
+                    r = item.get("text") or ""
+                    logger.info("[%s] codex %s reasoning_chars=%d", resp_id, t, len(str(r)))
+                    return
+                logger.info("[%s] codex %s item_type=%s", resp_id, t, itype)
+                return
+
+        def _stderr_log(line: str) -> None:
+            if not settings.log_events:
+                return
+            logger.warning("[%s] codex stderr: %s", resp_id, _truncate_for_log(line))
+
+        if not req.stream:
+            usage: dict[str, int] | None = None
+            try:
+                async with sem:
+                    if provider == "codex":
+                        codex_model = provider_model or settings.default_model
+
+                        async def _run_codex_once(model_id: str):
+                            if use_codex_backend:
+                                auth = load_codex_auth(codex_cli_home=settings.codex_cli_home)
+                                token = auth.api_key or auth.access_token
+                                if not token:
+                                    raise RuntimeError(
+                                        "Missing Codex auth token (run `codex login` to create ~/.codex/auth.json)."
+                                    )
+                                headers = build_codex_headers(
+                                    token=token,
+                                    account_id=auth.account_id,
+                                    session_id=codex_session_id,
+                                    version=settings.codex_responses_version,
+                                    user_agent=settings.codex_responses_user_agent,
+                                )
+                                backend_req = req.model_copy(
+                                    update={"model": model_id, "messages": _maybe_inject_automation_guard_messages(req.messages)}
+                                )
+                                payload = convert_chat_completions_to_codex_responses(
+                                    backend_req,
+                                    model_name=model_id,
+                                    force_stream=True,
+                                    reasoning_effort_override=(
+                                        "high" if reasoning_effort == "xhigh" else reasoning_effort
+                                    ),
+                                    allow_tools=settings.codex_allow_tools,
+                                )
+                                events = iter_codex_responses_events(
+                                    base_url=settings.codex_responses_base_url,
+                                    headers=headers,
+                                    payload=payload,
+                                    timeout_seconds=settings.timeout_seconds,
+                                    event_callback=_evt_log if settings.log_events else None,
+                                    response_headers_cb=_capture_codex_headers,
+                                )
+                                text, usage, tool_calls = await collect_codex_responses_text_and_usage(events)
+                                # Re-wrap usage into the same shape as codex exec path.
+                                return type(
+                                    "BackendResult",
+                                    (),
+                                    {"text": text, "usage": usage, "tool_calls": tool_calls},
+                                )()
+
+                            events = iter_codex_events(
+                                prompt=prompt,
+                                model=model_id,
+                                cd=settings.workspace,
+                                images=image_files,
+                                disable_shell_tool=settings.disable_shell_tool,
+                                disable_view_image_tool=settings.disable_view_image_tool,
+                                sandbox=settings.sandbox,
+                                skip_git_repo_check=settings.skip_git_repo_check,
+                                model_reasoning_effort=reasoning_effort,
+                                approval_policy=settings.approval_policy,
+                                enable_search=settings.enable_search,
+                                add_dirs=settings.add_dirs,
+                                codex_cli_home=settings.codex_cli_home,
+                                timeout_seconds=settings.timeout_seconds,
+                                stream_limit=settings.subprocess_stream_limit,
+                                event_callback=_evt_log,
+                                stderr_callback=_stderr_log,
+                            )
+                            return await collect_codex_text_and_usage_from_events(events)
+
+                        try:
+                            result = await _run_codex_once(codex_model)
+                        except Exception as e:
+                            # If Codex backend auth expired, refresh and retry once before model fallback.
+                            if use_codex_backend and ("codex responses failed: 401" in str(e) or "codex responses failed: 403" in str(e)):
+                                await maybe_refresh_codex_auth(
+                                    codex_cli_home=settings.codex_cli_home,
+                                    timeout_seconds=min(settings.timeout_seconds, 30),
+                                )
+                                result = await _run_codex_once(codex_model)
+                            else:
+                                fallback_model = settings.default_model
+                                if codex_model != fallback_model and _looks_like_unsupported_model_error(str(e)):
+                                    logger.warning(
+                                        "[%s] codex model unsupported: %s -> fallback=%s",
+                                        resp_id,
+                                        codex_model,
+                                        fallback_model,
+                                    )
+                                    result = await _run_codex_once(fallback_model)
+                                else:
+                                    raise
+                        text = result.text
+                        usage = result.usage
+                        tool_calls = getattr(result, "tool_calls", None)
+                    elif provider == "cursor-agent":
+                        cursor_model = provider_model or settings.cursor_agent_model or "auto"
+                        if settings.log_events:
+                            src = "request" if provider_model else ("env" if settings.cursor_agent_model else "default")
+                            logger.info("[%s] cursor-agent model=%s model_src=%s", resp_id, cursor_model, src)
+                        cursor_workspace = settings.cursor_agent_workspace or settings.workspace
+                        cmd = [
+                            settings.cursor_agent_bin,
+                            "-p",
+                            "--output-format",
+                            "stream-json",
+                            "--workspace",
+                            cursor_workspace,
+                            "--force",
+                            "--trust",
+                            "--approve-mcps",
+                        ]
+                        if settings.cursor_agent_disable_indexing:
+                            cmd.append("--disable-indexing")
+                        if settings.cursor_agent_extra_args:
+                            cmd.extend(settings.cursor_agent_extra_args)
+                        if settings.cursor_agent_api_key:
+                            cmd.extend(["--api-key", settings.cursor_agent_api_key])
+                        if cursor_model:
+                            cmd.extend(["--model", cursor_model])
+                        if settings.cursor_agent_stream_partial_output:
+                            cmd.append("--stream-partial-output")
+                        if settings.log_events:
+                            logger.info("[%s] cursor-agent cmd=%s", resp_id, " ".join(cmd[:12] + (["..."] if len(cmd) > 12 else [])))
+
+                        assembler = TextAssembler()
+                        fallback_text: str | None = None
+                        reported_model: str | None = None
+                        async for evt in iter_stream_json_events(
+                            cmd=cmd,
+                            stdin_data=prompt,
+                            env=None,
+                            timeout_seconds=settings.timeout_seconds,
+                            stream_limit=settings.subprocess_stream_limit,
+                            event_callback=_evt_log,
+                            stderr_callback=_stderr_log,
+                        ):
+                            if (
+                                reported_model is None
+                                and evt.get("type") == "system"
+                                and evt.get("subtype") == "init"
+                                and isinstance(evt.get("model"), str)
+                            ):
+                                reported_model = evt["model"]
+                                if settings.log_events:
+                                    logger.info(
+                                        "[%s] cursor-agent init model=%s apiKeySource=%s permissionMode=%s session_id=%s",
+                                        resp_id,
+                                        reported_model,
+                                        evt.get("apiKeySource"),
+                                        evt.get("permissionMode"),
+                                        evt.get("session_id"),
+                                    )
+                            extract_cursor_agent_delta(evt, assembler)
+                            maybe_usage = extract_usage_from_cursor_agent_result(evt)
+                            if maybe_usage:
+                                usage = maybe_usage
+                            if evt.get("type") == "result" and isinstance(evt.get("result"), str):
+                                fallback_text = evt["result"]
+                        text = assembler.text or (fallback_text or "")
+                    elif provider == "claude":
+                        claude_model = provider_model or settings.claude_model or "sonnet"
+                        if use_claude_oauth:
+                            if settings.log_events:
+                                logger.info(
+                                    "[%s] claude-oauth url=%s/v1/messages model=%s creds=%s",
+                                    resp_id,
+                                    settings.claude_api_base_url,
+                                    claude_model,
+                                    settings.claude_oauth_creds_path,
+                                )
+                            msgs = _maybe_inject_automation_guard_messages(req.messages)
+                            req2 = ChatCompletionRequest(
+                                model=req.model,
+                                messages=msgs,
+                                stream=req.stream,
+                                max_tokens=req.max_tokens,
+                            )
+                            text, usage = await claude_oauth_generate(req=req2, model_name=claude_model)
+                        else:
+                            cmd = [
+                                settings.claude_bin,
+                                "--verbose",
+                                "-p",
+                                "--output-format",
+                                "stream-json",
+                                "--add-dir",
+                                settings.workspace,
+                                "--dangerously-skip-permissions",  # Auto-approve shell commands
+                            ]
+                            for d in settings.add_dirs:
+                                cmd.extend(["--add-dir", d])
+                            if claude_model:
+                                cmd.extend(["--model", claude_model])
+                            cmd.append("--")
+
+                            assembler = TextAssembler()
+                            fallback_text = None
+                            async for evt in iter_stream_json_events(
+                                cmd=cmd,
+                                stdin_data=prompt,
+                                env=None,
+                                timeout_seconds=settings.timeout_seconds,
+                                stream_limit=settings.subprocess_stream_limit,
+                                event_callback=_evt_log,
+                                stderr_callback=_stderr_log,
+                            ):
+                                extract_claude_delta(evt, assembler)
+                                maybe_usage = extract_usage_from_claude_result(evt)
+                                if maybe_usage:
+                                    usage = maybe_usage
+                                if evt.get("type") == "result" and isinstance(evt.get("result"), str):
+                                    fallback_text = evt["result"]
+                            text = assembler.text or (fallback_text or "")
+                    elif provider == "gemini":
+                        gemini_model = provider_model or settings.gemini_model or "gemini-3-flash-preview"
+                        if use_gemini_cloudcode:
+                            if settings.log_events:
+                                logger.info(
+                                    "[%s] gemini-cloudcode url=%s/v1internal:generateContent model=%s creds=%s",
+                                    resp_id,
+                                    settings.gemini_cloudcode_base_url,
+                                    gemini_model,
+                                    settings.gemini_oauth_creds_path,
+                                )
+                            msgs = _maybe_inject_automation_guard_messages(req.messages)
+                            req2 = ChatCompletionRequest(model=req.model, messages=msgs, stream=req.stream)
+                            text, usage = await gemini_cloudcode_generate(
+                                req2,
+                                model_name=gemini_model,
+                                reasoning_effort=reasoning_effort,
+                                timeout_seconds=settings.timeout_seconds,
+                            )
+                        else:
+                            cmd = [settings.gemini_bin, "-o", "stream-json"]
+                            if gemini_model:
+                                cmd.extend(["-m", gemini_model])
+
+                            assembler = TextAssembler()
+                            async for evt in iter_stream_json_events(
+                                cmd=cmd,
+                                stdin_data=prompt,
+                                env=None,
+                                timeout_seconds=settings.timeout_seconds,
+                                stream_limit=settings.subprocess_stream_limit,
+                                event_callback=_evt_log,
+                                stderr_callback=_stderr_log,
+                            ):
+                                extract_gemini_delta(evt, assembler)
+                                maybe_usage = extract_usage_from_gemini_result(evt)
+                                if maybe_usage:
+                                    usage = maybe_usage
+                            text = assembler.text
+                    else:
+                        raise RuntimeError(f"Unknown provider: {provider}")
+            finally:
+                if tmpdir is not None:
+                    tmpdir.cleanup()
+
+            text = _maybe_strip_answer_tags(text).strip()
+            duration_ms = int((time.time() - t0) * 1000)
+            
+            # Record stats and decrement active count
+            _active_requests -= 1
+            _request_stats.record_success(duration_ms, usage)
+            _maybe_print_stats()
+            
+            if log_mode == "qa" and text:
+                # Retrieve stored question and print Q+A together
+                stored_q = _pending_questions.pop(resp_id, "")
+                if not _print_qa_together(resp_id, stored_q, text, duration_ms=duration_ms, usage=usage):
+                    # Fallback to plain logging
+                    usage_str = f" usage={usage}" if isinstance(usage, dict) else ""
+                    logger.info("[%s] response status=200 duration_ms=%d chars=%d%s", resp_id, duration_ms, len(text), usage_str)
+                    if stored_q:
+                        logger.info("[%s] Q:\n%s", resp_id, _truncate_for_log(stored_q))
+                    logger.info("[%s] A:\n%s", resp_id, _truncate_for_log(text))
+            elif log_mode == "full" and text:
+                _pending_questions.pop(resp_id, None)  # Clean up
+                if not _maybe_print_markdown(resp_id, "RESPONSE", text, duration_ms=duration_ms, usage=usage):
+                    usage_str = f" usage={usage}" if isinstance(usage, dict) else ""
+                    logger.info("[%s] response status=200 duration_ms=%d chars=%d%s", resp_id, duration_ms, len(text), usage_str)
+                    logger.info("[%s] RESPONSE:\n%s", resp_id, _truncate_for_log(text))
+            elif not settings.log_render_markdown:
+                _pending_questions.pop(resp_id, None)  # Clean up
+                # Only log summary when not using rich panels
+                usage_str = f" usage={usage}" if isinstance(usage, dict) else ""
+                logger.info("[%s] response status=200 duration_ms=%d chars=%d%s", resp_id, duration_ms, len(text), usage_str)
+            finish_reason = "tool_calls" if tool_calls else "stop"
+            message: dict = {"role": "assistant", "content": text}
+            if tool_calls:
+                message["tool_calls"] = tool_calls
+
+            response: dict = {
+                "id": resp_id,
+                "object": "chat.completion",
+                "created": created,
+                "model": requested_model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": message,
+                        "finish_reason": finish_reason,
+                    }
+                ],
+            }
+            if usage is not None:
+                response["usage"] = usage
+            if codex_response_headers:
+                return JSONResponse(content=response, headers=codex_response_headers)
+            return response
+
+        async def sse_gen():
+            global _active_requests
+            assembled_text = ""
+            stream_usage: dict[str, object] | None = None
+            stream_tool_calls: list[dict[str, object]] | None = None
+            try:
+                async with sem:
+                    # initial role chunk
+                    first = {
+                        "id": resp_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": requested_model,
+                        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+                    }
+                    yield f"data: {json.dumps(first, ensure_ascii=False)}\n\n"
+                    keepalive = max(settings.sse_keepalive_seconds, 0)
+                    attempt_models: list[str | None]
+                    if provider == "codex":
+                        first_model = provider_model or settings.default_model
+                        fallback_model = settings.default_model
+                        attempt_models = [first_model]
+                        if first_model != fallback_model:
+                            attempt_models.append(fallback_model)
+                    else:
+                        attempt_models = [provider_model]
+
+                    for attempt_idx, attempt_model in enumerate(attempt_models):
+                        if provider == "codex":
+                            codex_model = attempt_model or settings.default_model
+                            if use_codex_backend:
+                                auth = load_codex_auth(codex_cli_home=settings.codex_cli_home)
+                                token = auth.api_key or auth.access_token
+                                if not token:
+                                    # Best-effort refresh (e.g. first-time login) before failing.
+                                    await maybe_refresh_codex_auth(
+                                        codex_cli_home=settings.codex_cli_home,
+                                        timeout_seconds=min(settings.timeout_seconds, 30),
+                                    )
+                                    auth = load_codex_auth(codex_cli_home=settings.codex_cli_home)
+                                    token = auth.api_key or auth.access_token
+                                if not token:
+                                    raise RuntimeError(
+                                        "Missing Codex auth token (run `codex login` to create ~/.codex/auth.json)."
+                                    )
+                                headers = build_codex_headers(
+                                    token=token,
+                                    account_id=auth.account_id,
+                                    session_id=codex_session_id,
+                                    version=settings.codex_responses_version,
+                                    user_agent=settings.codex_responses_user_agent,
+                                )
+                                backend_req = req.model_copy(
+                                    update={
+                                        "model": codex_model,
+                                        "messages": _maybe_inject_automation_guard_messages(req.messages),
+                                    }
+                                )
+                                payload = convert_chat_completions_to_codex_responses(
+                                    backend_req,
+                                    model_name=codex_model,
+                                    force_stream=True,
+                                    reasoning_effort_override=(
+                                        "high" if reasoning_effort == "xhigh" else reasoning_effort
+                                    ),
+                                    allow_tools=settings.codex_allow_tools,
+                                )
+                                events = iter_codex_responses_events(
+                                    base_url=settings.codex_responses_base_url,
+                                    headers=headers,
+                                    payload=payload,
+                                    timeout_seconds=settings.timeout_seconds,
+                                    event_callback=_evt_log if settings.log_events else None,
+                                )
+                            else:
+                                events = iter_codex_events(
+                                    prompt=prompt,
+                                    model=codex_model,
+                                    cd=settings.workspace,
+                                    images=image_files,
+                                    disable_shell_tool=settings.disable_shell_tool,
+                                    disable_view_image_tool=settings.disable_view_image_tool,
+                                    sandbox=settings.sandbox,
+                                    skip_git_repo_check=settings.skip_git_repo_check,
+                                    model_reasoning_effort=reasoning_effort,
+                                    approval_policy=settings.approval_policy,
+                                    enable_search=settings.enable_search,
+                                    add_dirs=settings.add_dirs,
+                                    codex_cli_home=settings.codex_cli_home,
+                                    timeout_seconds=settings.timeout_seconds,
+                                    stream_limit=settings.subprocess_stream_limit,
+                                    event_callback=_evt_log,
+                                    stderr_callback=_stderr_log,
+                                )
+                        elif provider == "cursor-agent":
+                            cursor_model = provider_model or settings.cursor_agent_model or "auto"
+                            cursor_init_logged = False
+                            if settings.log_events:
+                                src = "request" if provider_model else ("env" if settings.cursor_agent_model else "default")
+                                logger.info("[%s] cursor-agent model=%s model_src=%s", resp_id, cursor_model, src)
+                            cursor_workspace = settings.cursor_agent_workspace or settings.workspace
+                            cmd = [
+                                settings.cursor_agent_bin,
+                                "-p",
+                                "--output-format",
+                                "stream-json",
+                                "--workspace",
+                                cursor_workspace,
+                                "--force",
+                                "--trust",
+                                "--approve-mcps",
+                            ]
+                            if settings.cursor_agent_disable_indexing:
+                                cmd.append("--disable-indexing")
+                            if settings.cursor_agent_extra_args:
+                                cmd.extend(settings.cursor_agent_extra_args)
+                            if settings.cursor_agent_api_key:
+                                cmd.extend(["--api-key", settings.cursor_agent_api_key])
+                            if cursor_model:
+                                cmd.extend(["--model", cursor_model])
+                            if settings.cursor_agent_stream_partial_output:
+                                cmd.append("--stream-partial-output")
+                            if settings.log_events:
+                                logger.info("[%s] cursor-agent cmd=%s", resp_id, " ".join(cmd[:12] + (["..."] if len(cmd) > 12 else [])))
+                            events = iter_stream_json_events(
+                                cmd=cmd,
+                                stdin_data=prompt,
+                                env=None,
+                                timeout_seconds=settings.timeout_seconds,
+                                stream_limit=settings.subprocess_stream_limit,
+                                event_callback=_evt_log,
+                                stderr_callback=_stderr_log,
+                            )
+                        elif provider == "claude":
+                            claude_model = provider_model or settings.claude_model or "sonnet"
+                            if use_claude_oauth:
+                                if settings.log_events:
+                                    logger.info(
+                                        "[%s] claude-oauth url=%s/v1/messages model=%s creds=%s",
+                                        resp_id,
+                                        settings.claude_api_base_url,
+                                        claude_model,
+                                        settings.claude_oauth_creds_path,
+                                    )
+                                msgs = _maybe_inject_automation_guard_messages(req.messages)
+                                req2 = ChatCompletionRequest(
+                                    model=req.model,
+                                    messages=msgs,
+                                    stream=req.stream,
+                                    max_tokens=req.max_tokens,
+                                )
+                                events = iter_claude_oauth_events(req=req2, model_name=claude_model)
+                            else:
+                                cmd = [
+                                    settings.claude_bin,
+                                    "--verbose",
+                                    "-p",
+                                    "--output-format",
+                                    "stream-json",
+                                    "--add-dir",
+                                    settings.workspace,
+                                    "--dangerously-skip-permissions",  # Auto-approve shell commands
+                                ]
+                                for d in settings.add_dirs:
+                                    cmd.extend(["--add-dir", d])
+                                if claude_model:
+                                    cmd.extend(["--model", claude_model])
+                                cmd.append("--")
+                                events = iter_stream_json_events(
+                                    cmd=cmd,
+                                    stdin_data=prompt,
+                                    env=None,
+                                    timeout_seconds=settings.timeout_seconds,
+                                    stream_limit=settings.subprocess_stream_limit,
+                                    event_callback=_evt_log,
+                                    stderr_callback=_stderr_log,
+                                )
+                        elif provider == "gemini":
+                            gemini_model = provider_model or settings.gemini_model or "gemini-3-flash-preview"
+                            if use_gemini_cloudcode:
+                                if settings.log_events:
+                                    logger.info(
+                                        "[%s] gemini-cloudcode url=%s/v1internal:streamGenerateContent?alt=sse model=%s creds=%s",
+                                        resp_id,
+                                        settings.gemini_cloudcode_base_url,
+                                        gemini_model,
+                                        settings.gemini_oauth_creds_path,
+                                    )
+                                msgs = _maybe_inject_automation_guard_messages(req.messages)
+                                req2 = ChatCompletionRequest(model=req.model, messages=msgs, stream=req.stream)
+                                events = iter_gemini_cloudcode_events(
+                                    req2,
+                                    model_name=gemini_model,
+                                    reasoning_effort=reasoning_effort,
+                                    timeout_seconds=settings.timeout_seconds,
+                                    event_callback=_evt_log if settings.log_events else None,
+                                )
+                            else:
+                                cmd = [settings.gemini_bin, "-o", "stream-json"]
+                                if gemini_model:
+                                    cmd.extend(["-m", gemini_model])
+                                events = iter_stream_json_events(
+                                    cmd=cmd,
+                                    stdin_data=prompt,
+                                    env=None,
+                                    timeout_seconds=settings.timeout_seconds,
+                                    stream_limit=settings.subprocess_stream_limit,
+                                    event_callback=_evt_log,
+                                    stderr_callback=_stderr_log,
+                                )
+                        else:
+                            raise RuntimeError(f"Unknown provider: {provider}")
+
+                        queue: asyncio.Queue[dict | None] = asyncio.Queue()
+                        assembler = TextAssembler()
+                        sent_content = False
+                        should_retry = False
+
+                        async def _pump_events() -> None:
+                            try:
+                                async with aclosing(events):
+                                    async for evt in events:
+                                        await queue.put(evt)
+                            except Exception as e:
+                                await queue.put({"_gateway_error": str(e)})
+                            finally:
+                                await queue.put(None)
+
+                        pump_task = asyncio.create_task(_pump_events())
+                        try:
+                            while True:
+                                if await request.is_disconnected():
+                                    return
+
+                                try:
+                                    if keepalive > 0:
+                                        evt = await asyncio.wait_for(queue.get(), timeout=keepalive)
+                                    else:
+                                        evt = await queue.get()
+                                except (asyncio.TimeoutError, TimeoutError):
+                                    yield ": ping\n\n"
+                                    continue
+
+                                if evt is None:
+                                    break
+
+                                if isinstance(evt, dict) and evt.get("_gateway_error"):
+                                    msg = str(evt.get("_gateway_error") or "")
+                                    if (
+                                        provider == "codex"
+                                        and attempt_idx == 0
+                                        and len(attempt_models) > 1
+                                        and not sent_content
+                                        and _looks_like_unsupported_model_error(msg)
+                                    ):
+                                        logger.warning(
+                                            "[%s] codex model unsupported: %s -> fallback=%s",
+                                            resp_id,
+                                            attempt_models[0],
+                                            attempt_models[1],
+                                        )
+                                        should_retry = True
+                                        break
+
+                                    if msg:
+                                        status = _extract_upstream_status_code(msg) or 500
+                                        logger.error(
+                                            "[%s] stream error status=%d %s",
+                                            resp_id,
+                                            status,
+                                            _truncate_for_log(msg),
+                                        )
+                                        _print_error_panel(resp_id, msg, status)
+                                        chunk = {
+                                            "id": resp_id,
+                                            "object": "chat.completion.chunk",
+                                            "created": created,
+                                            "model": requested_model,
+                                            "choices": [
+                                                {"index": 0, "delta": {"content": msg}, "finish_reason": None}
+                                            ],
+                                        }
+                                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                                    break
+
+                                delta = ""
+                                if provider == "codex":
+                                    if use_codex_backend:
+                                        if evt.get("type") == "response.output_text.delta" and isinstance(
+                                            evt.get("delta"), str
+                                        ):
+                                            delta = _maybe_strip_answer_tags(evt["delta"])
+                                        # Some short responses arrive only as a final "done" event.
+                                        if (
+                                            not delta
+                                            and not sent_content
+                                            and evt.get("type") == "response.output_text.done"
+                                            and isinstance(evt.get("text"), str)
+                                        ):
+                                            delta = _maybe_strip_answer_tags(evt["text"])
+                                        if evt.get("type") == "response.completed":
+                                            resp = evt.get("response") or {}
+                                            u = resp.get("usage") if isinstance(resp, dict) else None
+                                            if isinstance(u, dict):
+                                                prompt_tokens = int(u.get("input_tokens") or 0)
+                                                completion_tokens = int(u.get("output_tokens") or 0)
+                                                stream_usage = {
+                                                    "prompt_tokens": prompt_tokens,
+                                                    "completion_tokens": completion_tokens,
+                                                    "total_tokens": prompt_tokens + completion_tokens,
+                                                    "prompt_tokens_details": u.get("input_tokens_details")
+                                                    if isinstance(u.get("input_tokens_details"), dict)
+                                                    else {},
+                                                    "completion_tokens_details": u.get("output_tokens_details")
+                                                    if isinstance(u.get("output_tokens_details"), dict)
+                                                    else {},
+                                                }
+                                            if isinstance(resp, dict):
+                                                parsed_calls = extract_codex_tool_calls(resp)
+                                                if parsed_calls:
+                                                    stream_tool_calls = parsed_calls
+                                            break
+                                    else:
+                                        if evt.get("type") == "item.completed":
+                                            item = evt.get("item") or {}
+                                            if item.get("type") == "agent_message":
+                                                delta = _maybe_strip_answer_tags(str(item.get("text") or ""))
+                                elif provider == "cursor-agent":
+                                    if (
+                                        not cursor_init_logged
+                                        and isinstance(evt, dict)
+                                        and evt.get("type") == "system"
+                                        and evt.get("subtype") == "init"
+                                        and isinstance(evt.get("model"), str)
+                                    ):
+                                        cursor_init_logged = True
+                                        if settings.log_events:
+                                            logger.info(
+                                                "[%s] cursor-agent init model=%s apiKeySource=%s permissionMode=%s session_id=%s",
+                                                resp_id,
+                                                evt.get("model"),
+                                                evt.get("apiKeySource"),
+                                                evt.get("permissionMode"),
+                                                evt.get("session_id"),
+                                            )
+                                    delta = _maybe_strip_answer_tags(extract_cursor_agent_delta(evt, assembler))
+                                    maybe_usage = extract_usage_from_cursor_agent_result(evt)
+                                    if maybe_usage:
+                                        stream_usage = maybe_usage
+                                elif provider == "claude":
+                                    delta = _maybe_strip_answer_tags(extract_claude_delta(evt, assembler))
+                                elif provider == "gemini":
+                                    delta = _maybe_strip_answer_tags(extract_gemini_delta(evt, assembler))
+
+                                if delta:
+                                    sent_content = True
+                                    assembled_text += delta
+                                    if settings.log_stream_inline:
+                                        _stream_inline_append(resp_id, delta)
+                                    elif settings.log_stream_deltas:
+                                        logger.info("[%s] stream delta: %s", resp_id, _inline_log_text(delta))
+                                    chunk = {
+                                        "id": resp_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": requested_model,
+                                        "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
+                                    }
+                                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                        finally:
+                            pump_task.cancel()
+                            with suppress(asyncio.CancelledError):
+                                await pump_task
+
+                        if should_retry:
+                            continue
+                        break
+
+                    end = {
+                        "id": resp_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": requested_model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {},
+                                "finish_reason": "tool_calls" if stream_tool_calls else "stop",
+                            }
+                        ],
+                    }
+                    # Include usage in final chunk for OpenClaw/OpenAI compatibility
+                    if stream_usage:
+                        end["usage"] = stream_usage
+                    if stream_tool_calls:
+                        tool_chunk = {
+                            "id": resp_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": requested_model,
+                            "choices": [{"index": 0, "delta": {"tool_calls": stream_tool_calls}, "finish_reason": None}],
+                        }
+                        yield f"data: {json.dumps(tool_chunk, ensure_ascii=False)}\n\n"
+                    yield f"data: {json.dumps(end, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+            finally:
+                if tmpdir is not None:
+                    tmpdir.cleanup()
+                if settings.log_stream_inline:
+                    _stream_inline_close(resp_id)
+                assembled = _maybe_strip_answer_tags(assembled_text).strip()
+                duration_ms = int((time.time() - t0) * 1000)
+                
+                # Record stats and decrement active count
+                _active_requests -= 1
+                _request_stats.record_success(duration_ms, stream_usage)
+                _maybe_print_stats()
+
+                suppress_final = settings.log_stream_inline and settings.log_stream_inline_suppress_final
+                if suppress_final:
+                    _pending_questions.pop(resp_id, None)
+                    if not settings.log_render_markdown:
+                        usage_str = f" usage={stream_usage}" if isinstance(stream_usage, dict) else ""
+                        logger.info(
+                            "[%s] response status=200 duration_ms=%d chars=%d%s",
+                            resp_id,
+                            duration_ms,
+                            len(assembled),
+                            usage_str,
+                        )
+                elif log_mode == "qa" and assembled:
+                    # Retrieve stored question and print Q+A together
+                    stored_q = _pending_questions.pop(resp_id, "")
+                    if not _print_qa_together(resp_id, stored_q, assembled, duration_ms=duration_ms, usage=stream_usage):
+                        usage_str = f" usage={stream_usage}" if isinstance(stream_usage, dict) else ""
+                        logger.info("[%s] response status=200 duration_ms=%d chars=%d%s", resp_id, duration_ms, len(assembled), usage_str)
+                        if stored_q:
+                            logger.info("[%s] Q:\n%s", resp_id, _truncate_for_log(stored_q))
+                        logger.info("[%s] A:\n%s", resp_id, _truncate_for_log(assembled))
+                elif log_mode == "full" and assembled:
+                    _pending_questions.pop(resp_id, None)  # Clean up
+                    if not _maybe_print_markdown(resp_id, "RESPONSE", assembled, duration_ms=duration_ms, usage=stream_usage):
+                        usage_str = f" usage={stream_usage}" if isinstance(stream_usage, dict) else ""
+                        logger.info("[%s] response status=200 duration_ms=%d chars=%d%s", resp_id, duration_ms, len(assembled), usage_str)
+                        logger.info("[%s] RESPONSE:\n%s", resp_id, _truncate_for_log(assembled))
+                elif not settings.log_render_markdown:
+                    _pending_questions.pop(resp_id, None)  # Clean up
+                    usage_str = f" usage={stream_usage}" if isinstance(stream_usage, dict) else ""
+                    logger.info("[%s] response status=200 duration_ms=%d chars=%d%s", resp_id, duration_ms, len(assembled), usage_str)
+
+        stream_headers = codex_response_headers if codex_response_headers else None
+        return StreamingResponse(sse_gen(), media_type="text/event-stream", headers=stream_headers)
+    except (asyncio.TimeoutError, TimeoutError):
+        error_msg = f"Request timed out after {settings.timeout_seconds}s"
+        logger.error("[%s] error status=504 timeout_seconds=%d", resp_id, settings.timeout_seconds)
+        _active_requests -= 1
+        _pending_questions.pop(resp_id, None)  # Clean up
+        _request_stats.record_failure()
+        _print_error_panel(resp_id, error_msg, 504)
+        return _openai_error(error_msg, status_code=504)
+    except HTTPException:
+        # Let FastAPI handle already-structured HTTP errors (auth, validation, etc.).
+        _active_requests -= 1
+        _pending_questions.pop(resp_id, None)  # Clean up
+        _request_stats.record_failure()
+        raise
+    except Exception as e:
+        upstream = _extract_upstream_status_code(e)
+        status = upstream or 500
+        error_msg = str(e)
+        logger.error("[%s] error status=%d %s", resp_id, status, _truncate_for_log(error_msg))
+        _active_requests -= 1
+        _pending_questions.pop(resp_id, None)  # Clean up
+        _request_stats.record_failure()
+        _print_error_panel(resp_id, error_msg, status)
+        return _openai_error(error_msg, status_code=status)
